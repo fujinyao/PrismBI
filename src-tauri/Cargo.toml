@@ -1,0 +1,32 @@
+[package]
+name = "prism-bi"
+version = "4.0.0"
+description = "PrismBI - Next Generation AI BI Tool"
+authors = ["WrenAI"]
+edition = "2021"
+rust-version = "1.82"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-process = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"
+log = "0.4"
+env_logger = "0.11"
+open = "5"
+reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(mobile)'] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+opt-level = "s"

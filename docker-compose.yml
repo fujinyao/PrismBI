@@ -1,0 +1,57 @@
+services:
+  prism-bi-backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        - PIP_INDEX_URL=${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+        - PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST:-pypi.tuna.tsinghua.edu.cn}
+        - PIP_DEFAULT_TIMEOUT=${PIP_DEFAULT_TIMEOUT:-120}
+        - PIP_RETRIES=${PIP_RETRIES:-8}
+    container_name: prismbi-backend
+    restart: unless-stopped
+    ports:
+      - "8400:8400"
+    environment:
+      - PRISMBI_DB_PATH=/data/prismbi.duckdb
+      - PRISMBI_DATA_DIR=/data
+      - PRISMBI_ENCRYPTION_KEY_FILE=/data/master.key
+      - PRISMBI_BOOTSTRAP_ADMIN_PASSWORD_FILE=/data/bootstrap-admin-password
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-change-me-in-production}
+      - PRISMBI_ALLOW_DEFAULT_SECRET=${PRISMBI_ALLOW_DEFAULT_SECRET:-true}
+      - PRISMBI_CORS_ORIGINS=http://localhost:5173,https://tauri.localhost
+      - PRISMBI_ADMIN_PASSWORD=${PRISMBI_ADMIN_PASSWORD:-}
+      # Ollama 宿主机地址（容器内 localhost 指向自身）
+      - OLLAMA_HOST=http://host.docker.internal:11434
+    volumes:
+      - prismbi-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8400/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  prism-bi-frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        - API_INTERNAL_URL=http://prismbi-backend:8400
+        - WS_INTERNAL_URL=http://prismbi-backend:8400
+        - NEXT_PUBLIC_API_URL=/api
+        - NEXT_PUBLIC_ASK_HTTP_FALLBACK=${NEXT_PUBLIC_ASK_HTTP_FALLBACK:-0}
+        - NEXT_PUBLIC_ASK_SSE_IDLE_TIMEOUT_MS=${NEXT_PUBLIC_ASK_SSE_IDLE_TIMEOUT_MS:-0}
+    container_name: prismbi-frontend
+    restart: unless-stopped
+    depends_on:
+      prism-bi-backend:
+        condition: service_healthy
+    ports:
+      - "5173:5173"
+    environment:
+      - PORT=5173
+      - HOSTNAME=0.0.0.0
+
+volumes:
+  prismbi-data:

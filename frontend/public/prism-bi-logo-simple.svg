@@ -1,0 +1,158 @@
+<svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="prismGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#7763CF;stop-opacity:1" />
+      <stop offset="50%" style="stop-color:#444CE7;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#1570EF;stop-opacity:1" />
+    </linearGradient>
+
+    <linearGradient id="light1" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#7763CF;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#1570EF;stop-opacity:1" />
+    </linearGradient>
+
+    <linearGradient id="light2" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#1570EF;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#0086C9;stop-opacity:1" />
+    </linearGradient>
+
+    <linearGradient id="light3" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#0086C9;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#EF8D0C;stop-opacity:1" />
+    </linearGradient>
+
+    <linearGradient id="rainbowEdge" x1="56" y1="50" x2="200" y2="180" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#F472B6" />
+      <stop offset="18%" stop-color="#A78BFA" />
+      <stop offset="36%" stop-color="#60A5FA" />
+      <stop offset="54%" stop-color="#22D3EE" />
+      <stop offset="72%" stop-color="#34D399" />
+      <stop offset="88%" stop-color="#FBBF24" />
+      <stop offset="100%" stop-color="#FB7185" />
+    </linearGradient>
+
+    <linearGradient id="incomingGlow" x1="34" y1="108" x2="130" y2="52" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0" />
+      <stop offset="45%" stop-color="#E0F2FE" stop-opacity="0.5" />
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0.95" />
+    </linearGradient>
+
+    <linearGradient id="valueSpectrum" x1="130" y1="92" x2="232" y2="176" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.55" />
+      <stop offset="16%" stop-color="#A78BFA" stop-opacity="0.55" />
+      <stop offset="32%" stop-color="#60A5FA" stop-opacity="0.58" />
+      <stop offset="50%" stop-color="#22D3EE" stop-opacity="0.55" />
+      <stop offset="68%" stop-color="#34D399" stop-opacity="0.52" />
+      <stop offset="84%" stop-color="#FBBF24" stop-opacity="0.55" />
+      <stop offset="100%" stop-color="#FB7185" stop-opacity="0" />
+    </linearGradient>
+
+    <radialGradient id="auraWash" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(132 126) rotate(56) scale(92 84)">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.18" />
+      <stop offset="35%" stop-color="#A78BFA" stop-opacity="0.16" />
+      <stop offset="58%" stop-color="#22D3EE" stop-opacity="0.12" />
+      <stop offset="78%" stop-color="#FBBF24" stop-opacity="0.1" />
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0" />
+    </radialGradient>
+
+    <radialGradient id="circumHalo" cx="128" cy="135" r="125" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0" />
+      <stop offset="66%" stop-color="#FFFFFF" stop-opacity="0" />
+      <stop offset="69%" stop-color="#F472B6" stop-opacity="0.16" />
+      <stop offset="74%" stop-color="#A78BFA" stop-opacity="0.24" />
+      <stop offset="80%" stop-color="#60A5FA" stop-opacity="0.22" />
+      <stop offset="86%" stop-color="#22D3EE" stop-opacity="0.18" />
+      <stop offset="92%" stop-color="#FBBF24" stop-opacity="0.14" />
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0" />
+    </radialGradient>
+
+    <filter id="softRainbowGlow" x="28" y="22" width="200" height="186" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="7" result="blur" />
+      <feColorMatrix in="blur" type="matrix" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 0.62 0" />
+    </filter>
+
+    <filter id="beamGlow" x="24" y="38" width="220" height="166" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="5" result="blur" />
+      <feColorMatrix in="blur" type="matrix" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 0.45 0" />
+    </filter>
+
+    <linearGradient id="glass" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#FFFFFF;stop-opacity:0.4" />
+      <stop offset="100%" style="stop-color:#FFFFFF;stop-opacity:0" />
+    </linearGradient>
+  </defs>
+
+  <!-- Soft ambient value spectrum around the prism -->
+  <ellipse cx="138" cy="127" rx="92" ry="78" fill="url(#auraWash)" />
+  <circle cx="128" cy="135" r="125" fill="url(#circumHalo)" />
+
+  <!-- Enlarged rainbow halo, with its inner circle passing through the prism vertices. -->
+  <g opacity="0.5" filter="url(#softRainbowGlow)">
+    <circle cx="128" cy="135" r="95" stroke="#F472B6" stroke-width="10" fill="none" stroke-linecap="round" stroke-dasharray="70 548" transform="rotate(-95 128 135)" />
+    <circle cx="128" cy="135" r="101" stroke="#A78BFA" stroke-width="12" fill="none" stroke-linecap="round" stroke-dasharray="88 547" transform="rotate(-42 128 135)" />
+    <circle cx="128" cy="135" r="108" stroke="#60A5FA" stroke-width="12" fill="none" stroke-linecap="round" stroke-dasharray="96 583" transform="rotate(10 128 135)" />
+    <circle cx="128" cy="135" r="115" stroke="#22D3EE" stroke-width="13" fill="none" stroke-linecap="round" stroke-dasharray="104 619" transform="rotate(62 128 135)" />
+    <circle cx="128" cy="135" r="122" stroke="#34D399" stroke-width="12" fill="none" stroke-linecap="round" stroke-dasharray="84 682" transform="rotate(115 128 135)" />
+    <circle cx="128" cy="135" r="128" stroke="#FBBF24" stroke-width="10" fill="none" stroke-linecap="round" stroke-dasharray="68 736" transform="rotate(165 128 135)" />
+  </g>
+
+  <!-- Main Prism Triangle glow -->
+  <path d="M128 50 L200 180 L56 180 Z" stroke="url(#rainbowEdge)" stroke-width="12" stroke-linejoin="round" opacity="0.34" filter="url(#softRainbowGlow)" />
+  <path d="M128 50 L200 180 L56 180 Z" stroke="url(#rainbowEdge)" stroke-width="5" stroke-linejoin="round" opacity="0.42" />
+
+  <!-- Incoming light bloom -->
+  <path d="M40 96 L128 50" stroke="url(#incomingGlow)" stroke-width="15" stroke-linecap="round" opacity="0.28" filter="url(#beamGlow)" />
+
+  <!-- Reflected business value colors -->
+  <g opacity="0.58" filter="url(#beamGlow)">
+    <path d="M132 86 C158 64 190 55 225 60" stroke="#A78BFA" stroke-width="8" stroke-linecap="round" />
+    <path d="M137 105 C166 92 196 88 230 94" stroke="#60A5FA" stroke-width="7" stroke-linecap="round" />
+    <path d="M142 124 C170 124 199 128 229 139" stroke="#22D3EE" stroke-width="7" stroke-linecap="round" />
+    <path d="M145 145 C171 158 196 170 224 193" stroke="#34D399" stroke-width="6" stroke-linecap="round" />
+    <path d="M108 174 C86 194 62 202 34 202" stroke="#FBBF24" stroke-width="6" stroke-linecap="round" opacity="0.72" />
+  </g>
+
+  <path d="M128 86 C152 86 183 96 226 120 C186 124 164 136 142 158 C139 135 136 110 128 86 Z" fill="url(#valueSpectrum)" opacity="0.22" />
+
+  <!-- Main Prism Triangle -->
+  <path d="M128 50 L200 180 L56 180 Z" fill="url(#prismGrad)" />
+  <path d="M128 50 L200 180 L56 180 Z" fill="url(#glass)" />
+  <path d="M128 50 L200 180 L56 180 Z" stroke="#444CE7" stroke-width="2.5" fill="none" opacity="0.6" />
+
+  <!-- Fine rainbow rim on the prism edge -->
+  <path d="M128 50 L200 180 L56 180 Z" stroke="url(#rainbowEdge)" stroke-width="1.35" stroke-linejoin="round" fill="none" opacity="0.9" />
+
+  <!-- Center line highlight -->
+  <line x1="128" y1="50" x2="128" y2="180" stroke="#FFFFFF" stroke-width="1.5" opacity="0.3" />
+
+  <!-- Light beam input -->
+  <line x1="50" y1="90" x2="128" y2="50" stroke="#FFFFFF" stroke-width="2.5" opacity="0.55" />
+
+  <!-- Refracted beams -->
+  <!-- Beam 1 - Purple/Blue -->
+  <line x1="128" y1="100" x2="210" y2="85" stroke="url(#light1)" stroke-width="2.5" opacity="0.88" />
+
+  <!-- Beam 2 - Blue -->
+  <line x1="135" y1="120" x2="215" y2="115" stroke="url(#light2)" stroke-width="2.5" opacity="0.88" />
+
+  <!-- Beam 3 - Cyan/Orange -->
+  <line x1="142" y1="140" x2="220" y2="150" stroke="url(#light3)" stroke-width="2.5" opacity="0.88" />
+
+  <!-- Beam 4 - Orange -->
+  <line x1="145" y1="160" x2="218" y2="185" stroke="#EF8D0C" stroke-width="2.5" opacity="0.88" />
+
+  <!-- Data visualization bars -->
+  <g opacity="0.72">
+    <rect x="185" y="75" width="5" height="12" rx="1" fill="#7763CF" />
+    <rect x="195" y="68" width="5" height="19" rx="1" fill="#444CE7" />
+    <rect x="205" y="72" width="5" height="15" rx="1" fill="#1570EF" />
+  </g>
+
+  <!-- Data points on middle beam -->
+  <circle cx="175" cy="115" r="2.5" fill="#1570EF" />
+  <circle cx="190" cy="118" r="2.5" fill="#0086C9" />
+  <circle cx="205" cy="120" r="2.5" fill="#0086C9" />
+  <line x1="175" y1="115" x2="190" y2="118" stroke="#1570EF" stroke-width="1.5" opacity="0.6" />
+  <line x1="190" y1="118" x2="205" y2="120" stroke="#0086C9" stroke-width="1.5" opacity="0.6" />
+
+</svg>

@@ -1,0 +1,118 @@
+@import 'tailwindcss';
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --color-primary: #1677ff;
+  --color-primary-50: #f0f5ff;
+  --color-primary-100: #d6e4ff;
+  --color-primary-200: #adc8ff;
+  --color-primary-300: #85a5ff;
+  --color-primary-400: #597ef7;
+  --color-primary-500: #1677ff;
+  --color-primary-600: #0958d9;
+  --color-primary-700: #003eb3;
+  --color-primary-800: #002c8c;
+  --color-primary-900: #001d66;
+  --color-success: #52c41a;
+  --color-success-50: #f6ffed;
+  --color-success-100: #d9f7be;
+  --color-success-200: #b7eb8f;
+  --color-success-300: #95de64;
+  --color-success-400: #73d13d;
+  --color-success-500: #52c41a;
+  --color-success-600: #389e0d;
+  --color-success-700: #237804;
+  --color-success-800: #135200;
+  --color-success-900: #092b00;
+  --color-warning: #faad14;
+  --color-warning-50: #fffbe6;
+  --color-warning-100: #fff1b8;
+  --color-warning-200: #ffe58f;
+  --color-warning-300: #ffd666;
+  --color-warning-400: #ffc53d;
+  --color-warning-500: #faad14;
+  --color-warning-600: #d48806;
+  --color-warning-700: #ad6800;
+  --color-warning-800: #874d00;
+  --color-warning-900: #613400;
+  --color-error: #ff4d4f;
+  --color-error-50: #fff2f0;
+  --color-error-100: #fff1f0;
+  --color-error-200: #ffccc7;
+  --color-error-300: #ffa39e;
+  --color-error-400: #ff7875;
+  --color-error-500: #ff4d4f;
+  --color-error-600: #f5222d;
+  --color-error-700: #cf1322;
+  --color-error-800: #a8071a;
+  --color-error-900: #820014;
+  --color-surface: #ffffff;
+  --color-surface-dark: #1f1f1f;
+}
+
+:root {
+  --color-bg: #f5f5f5;
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+}
+
+.dark {
+  --color-bg: #141414;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  background-color: var(--color-bg);
+  color: #1a1a1a;
+}
+
+.dark body {
+  color: #e5e5e5;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #d1d5db;
+  border-radius: 3px;
+}
+
+.dark ::-webkit-scrollbar-thumb {
+  background: #4b5563;
+}
+
+pre, code {
+  font-family: var(--font-mono);
+}
