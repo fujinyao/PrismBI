@@ -37,6 +37,16 @@ const ENABLE_HTTP_SHORT_FALLBACK = ASK_HTTP_FALLBACK_FLAG === '1' || ASK_HTTP_FA
 const SSE_IDLE_TIMEOUT_MS_RAW = Number(process.env.NEXT_PUBLIC_ASK_SSE_IDLE_TIMEOUT_MS || '0')
 const SSE_IDLE_TIMEOUT_MS = Number.isFinite(SSE_IDLE_TIMEOUT_MS_RAW) && SSE_IDLE_TIMEOUT_MS_RAW > 0 ? SSE_IDLE_TIMEOUT_MS_RAW : 0
 const HOME_SHORT_CACHE_MS = 5000
+const PREVIOUS_CONTEXT_LIMIT = 5
+const PREVIOUS_ANSWER_MAX_CHARS = 400
+
+function compactPreviousAnswer(value: string): string {
+  const normalized = String(value || '').trim()
+  if (normalized.length <= PREVIOUS_ANSWER_MAX_CHARS) {
+    return normalized
+  }
+  return normalized.slice(0, PREVIOUS_ANSWER_MAX_CHARS)
+}
 
 interface ResponseSaveOverrides {
   sql?: string
@@ -107,6 +117,16 @@ export default function ThreadPage() {
     return undefined
   }, [currentProject?.id, visibleThread?.project_id])
   const responses = useMemo(() => visibleThread?.responses ?? [], [visibleThread?.responses])
+  const previousQuestionsContext = useMemo(
+    () => responses.map((response) => response.question).slice(-PREVIOUS_CONTEXT_LIMIT),
+    [responses],
+  )
+  const previousAnswersContext = useMemo(
+    () => responses
+      .map((response) => compactPreviousAnswer(response.answerDetail?.content || response.answerDetail?.error || ''))
+      .slice(-PREVIOUS_CONTEXT_LIMIT),
+    [responses],
+  )
   const initialQuestion = searchParams.get('question')
 
   const createClientRequestId = useCallback(() => {
@@ -358,13 +378,13 @@ export default function ThreadPage() {
       client_request_id: clientRequestId,
       question,
       thread_id: isTemporaryThread ? threadId : numericThreadId,
-      previous_questions: responses.map((response) => response.question).slice(-5),
-      previous_answers: responses.map((response) => response.answerDetail?.content || response.answerDetail?.error || '').slice(-5),
+      previous_questions: previousQuestionsContext,
+      previous_answers: previousAnswersContext,
       language: locale,
       preview_row_limit: previewRowLimit,
       temporary: isTemporaryThread,
     })
-  }), [createRequestStillProcessingError, isTemporaryThread, locale, logAskTransport, numericThreadId, responses, sendWs, t, threadId])
+  }), [createRequestStillProcessingError, isTemporaryThread, locale, logAskTransport, numericThreadId, previousAnswersContext, previousQuestionsContext, sendWs, t, threadId])
 
   const askViaSSE = useCallback(async (question: string, previewRowLimit: number, clientRequestId: string): Promise<AskResult> => {
     setWsStepProgress([])
@@ -380,8 +400,8 @@ export default function ThreadPage() {
     const body = {
       question,
       thread_id: isTemporaryThread ? threadId : numericThreadId,
-      previous_questions: responses.map((response) => response.question).slice(-5),
-      previous_answers: responses.map((response) => response.answerDetail?.content || response.answerDetail?.error || '').slice(-5),
+      previous_questions: previousQuestionsContext,
+      previous_answers: previousAnswersContext,
       language: locale,
       preview_row_limit: previewRowLimit,
       temporary: isTemporaryThread,
@@ -576,7 +596,7 @@ export default function ThreadPage() {
       hasResponse: !!sseResult.response,
     })
     return sseResult
-  }, [authToken, createRequestStillProcessingError, isTemporaryThread, locale, logAskTransport, numericThreadId, responses, t, threadId])
+  }, [authToken, createRequestStillProcessingError, isTemporaryThread, locale, logAskTransport, numericThreadId, previousAnswersContext, previousQuestionsContext, t, threadId])
 
   const shouldFallbackAfterTransportError = useCallback((err: unknown): boolean => {
     if (!(err instanceof Error)) return true
@@ -640,8 +660,8 @@ export default function ThreadPage() {
         const httpResult = await askApi.ask(
           question,
           isTemporaryThread ? threadId : numericThreadId,
-          responses.map((response) => response.question),
-          responses.map((response) => response.answerDetail?.content || response.answerDetail?.error || '').slice(-5),
+          previousQuestionsContext,
+          previousAnswersContext,
           locale,
           previewRowLimit,
           isTemporaryThread,

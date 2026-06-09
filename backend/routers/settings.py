@@ -79,11 +79,18 @@ def _force_refresh_runtime_router_settings() -> dict[str, object]:
         "max_source_materialization_rows": snapshot.get("MAX_SOURCE_MATERIALIZATION_ROWS"),
         "analysis_cache_max": snapshot.get("analysis_cache_max"),
         "analysis_cache_ttl_s": snapshot.get("analysis_cache_ttl_s"),
+        "adaptive_strategy_enabled": router_config.get("adaptive_strategy_enabled"),
+        "adaptive_strategy_consensus_risk_threshold": router_config.get("adaptive_strategy_consensus_risk_threshold"),
+        "adaptive_strategy_decompose_risk_threshold": router_config.get("adaptive_strategy_decompose_risk_threshold"),
+        "adaptive_strategy_min_subquestions_for_decompose": router_config.get("adaptive_strategy_min_subquestions_for_decompose"),
         "route_observability_window_seconds": router_config.get("route_observability_window_seconds"),
         "route_observability_max_events_per_project": router_config.get("route_observability_max_events_per_project"),
         "route_observability_persist_enabled": router_config.get("route_observability_persist_enabled"),
         "route_observability_persist_interval_seconds": router_config.get("route_observability_persist_interval_seconds"),
         "route_observability_persist_event_delta": router_config.get("route_observability_persist_event_delta"),
+        "route_observability_strategy_trend_max_points": router_config.get("route_observability_strategy_trend_max_points"),
+        "route_observability_strategy_trend_persist_interval_seconds": router_config.get("route_observability_strategy_trend_persist_interval_seconds"),
+        "route_observability_strategy_trend_persist_decision_delta": router_config.get("route_observability_strategy_trend_persist_decision_delta"),
         "sql_route_v2_enabled": router_config.get("sql_route_v2_enabled"),
         "sql_route_shadow_mode": router_config.get("sql_route_shadow_mode"),
         "model_ref_case_sensitive": router_config.get("model_ref_case_sensitive"),
@@ -658,6 +665,8 @@ def list_llm_models(
     try:
         if provider == "anthropic":
             models = ANTHROPIC_MODELS
+        elif provider == "github_copilot":
+            models = []
         elif provider == "ollama":
             if not is_admin:
                 _validate_llm_endpoint_url(endpoint)
@@ -956,6 +965,10 @@ ROUTER_SETTINGS_MAP = {
     "tier1_max_retries": "router_tier1_max_retries",
     "tier2_max_retries": "router_tier2_max_retries",
     "tier3_max_retries": "router_tier3_max_retries",
+    "adaptive_strategy_enabled": "router_adaptive_strategy_enabled",
+    "adaptive_strategy_consensus_risk_threshold": "router_adaptive_strategy_consensus_risk_threshold",
+    "adaptive_strategy_decompose_risk_threshold": "router_adaptive_strategy_decompose_risk_threshold",
+    "adaptive_strategy_min_subquestions_for_decompose": "router_adaptive_strategy_min_subquestions_for_decompose",
     "tier1_max_columns_per_model": "router_tier1_max_columns_per_model",
     "tier2_max_columns_per_model": "router_tier2_max_columns_per_model",
     "tier3_max_columns_per_model": "router_tier3_max_columns_per_model",
@@ -965,6 +978,7 @@ ROUTER_SETTINGS_MAP = {
     "guidance_llm_available": "router_guidance_llm_available",
     "schema_pruning_enabled": "router_schema_pruning_enabled",
     "cross_source_max_workers": "router_cross_source_max_workers",
+    "decompose_merge_enabled": "router_decompose_merge_enabled",
     "decompose_merge_circuit_enabled": "router_decompose_merge_circuit_enabled",
     "decompose_merge_failure_threshold": "router_decompose_merge_failure_threshold",
     "decompose_merge_disable_seconds": "router_decompose_merge_disable_seconds",
@@ -979,6 +993,9 @@ ROUTER_SETTINGS_MAP = {
     "route_observability_persist_enabled": "router_route_observability_persist_enabled",
     "route_observability_persist_interval_seconds": "router_route_observability_persist_interval_seconds",
     "route_observability_persist_event_delta": "router_route_observability_persist_event_delta",
+    "route_observability_strategy_trend_max_points": "router_route_observability_strategy_trend_max_points",
+    "route_observability_strategy_trend_persist_interval_seconds": "router_route_observability_strategy_trend_persist_interval_seconds",
+    "route_observability_strategy_trend_persist_decision_delta": "router_route_observability_strategy_trend_persist_decision_delta",
     "sql_route_v2_enabled": "router_sql_route_v2_enabled",
     "sql_route_allowlist_projects": "router_sql_route_allowlist_projects",
     "sql_route_shadow_mode": "router_sql_route_shadow_mode",

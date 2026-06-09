@@ -47,7 +47,7 @@ const PROVIDER_DEFAULTS: Record<string, { endpoint: string; model: string; maxTo
     temperature: 0.7,
   },
   opencode_zen: {
-    endpoint: 'https://zen.opencode.ai/v1',
+    endpoint: 'https://opencode.ai/zen/v1',
     model: 'zen-1',
     maxTokens: 4096,
     temperature: 0.7,

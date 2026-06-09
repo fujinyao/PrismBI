@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from typing import Optional
@@ -18,6 +19,71 @@ from services.ask_service import AskCancelledError, ask_question as run_ask_ques
 from services.step_progress import StepProgress
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _coerce_stream_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
+    raw = os.getenv(name)
+    try:
+        value = int(raw) if raw is not None else int(default)
+    except Exception:
+        value = int(default)
+    if value < minimum:
+        return minimum
+    if value > maximum:
+        return maximum
+    return value
+
+
+_STREAM_MIN_CHARS = _coerce_stream_int_env("PRISMBI_ASK_STREAM_MIN_CHARS", 48, 20, 400)
+_STREAM_MAX_CHARS = _coerce_stream_int_env("PRISMBI_ASK_STREAM_MAX_CHARS", 80, 20, 800)
+if _STREAM_MAX_CHARS < _STREAM_MIN_CHARS:
+    _STREAM_MAX_CHARS = _STREAM_MIN_CHARS
+_STREAM_FLUSH_MS = _coerce_stream_int_env("PRISMBI_ASK_STREAM_FLUSH_MS", 40, 0, 2000)
+_STREAM_FLUSH_SECONDS = float(_STREAM_FLUSH_MS) / 1000.0
+_CHUNK_BOUNDARY_CHARS = frozenset(
+    {
+        " ",
+        "\n",
+        "\t",
+        ",",
+        ".",
+        ";",
+        ":",
+        "!",
+        "?",
+        ")",
+        "]",
+        "}",
+        "\uFF0C",
+        "\u3002",
+        "\uFF1B",
+        "\uFF1A",
+        "\uFF01",
+        "\uFF1F",
+        "\u3001",
+    }
+)
+
+
+def _chunk_text(text: str, min_chars: int = _STREAM_MIN_CHARS, max_chars: int = _STREAM_MAX_CHARS) -> list[str]:
+    if not text:
+        return []
+    normalized_min = max(1, int(min_chars))
+    normalized_max = max(normalized_min, int(max_chars))
+    chunks: list[str] = []
+    buffer: list[str] = []
+    for ch in text:
+        buffer.append(ch)
+        length = len(buffer)
+        should_flush = length >= normalized_max
+        if not should_flush and length >= normalized_min and ch in _CHUNK_BOUNDARY_CHARS:
+            should_flush = True
+        if should_flush:
+            chunks.append("".join(buffer))
+            buffer = []
+    if buffer:
+        chunks.append("".join(buffer))
+    return chunks
 
 router = APIRouter()
 _bearer = HTTPBearer(auto_error=False)
@@ -284,16 +350,13 @@ async def ask_stream_sse(body: AskRequest, payload: dict = Depends(_get_sse_user
             answer = data.get("summary", "") or ""
             sql = data.get("sql", "") or ""
             summary = answer
-            chunk_size = max(1, len(answer) // max(1, min(20, len(answer) // 8))) if answer else 0
 
             if answer:
-                pos = 0
-                while pos < len(answer):
-                    end = min(pos + chunk_size, len(answer))
-                    chunk = answer[pos:end]
+                chunks = _chunk_text(answer)
+                for i, chunk in enumerate(chunks):
                     yield f"data: {json.dumps({'type': 'delta', 'content_type': 'text', 'content': chunk})}\n\n"
-                    pos = end
-                    await asyncio.sleep(0.01)
+                    if i < len(chunks) - 1 and _STREAM_FLUSH_SECONDS > 0:
+                        await asyncio.sleep(_STREAM_FLUSH_SECONDS)
 
             response_data = data.get("response") or {}
             yield f"data: {json.dumps({'type': 'result', 'data': {'sql': sql, 'summary': summary, 'answer': answer, 'thread_id': data.get('thread_id'), 'response': response_data}})}\n\n"

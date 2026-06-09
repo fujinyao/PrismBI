@@ -10,6 +10,7 @@ import { LLMSettings } from '@/components/settings/LLMSettings'
 import { GeneralSettings } from '@/components/settings/GeneralSettings'
 import { SettingsAuditPanel } from '@/components/settings/SettingsAuditPanel'
 import { SecuritySettings } from '@/components/settings/SecuritySettings'
+import { AskRouterSettings } from '@/components/settings/AskRouterSettings'
 import { LanguageSwitcher } from '@/components/settings/LanguageSwitcher'
 import { Skeleton } from '@/components/ui/Skeleton'
 import { ErrorToast } from '@/components/ui/ErrorToast'
@@ -39,6 +40,7 @@ export default function SettingsPage() {
     { key: 'theme', label: t('settings.tabs.theme', 'Theme') },
     { key: 'llm', label: t('settings.tabs.llm', 'LLM') },
     { key: 'security', label: t('settings.tabs.security', 'Security') },
+    { key: 'ask', label: t('settings.tabs.ask', '问答') },
     { key: 'general', label: t('settings.tabs.general', 'General') },
   ].filter((tab) => tab.key === 'language' || canReadSettings)
 
@@ -160,6 +162,30 @@ export default function SettingsPage() {
       toast(err instanceof Error ? err.message : t('toast.generalSaveFailed', 'Failed to save general settings'), 'error'),
   })
 
+  const askMutation = useMutation({
+    mutationFn: (data: Record<string, unknown>) =>
+      settingsApi.askSettingsUpdate(data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['settings', 'private'] })
+      queryClient.invalidateQueries({ queryKey: ['settings', 'audit-summary'] })
+      toast(t('toast.askSettingsSaved', '问答设置已保存'), 'success')
+    },
+    onError: (err) =>
+      toast(err instanceof Error ? err.message : t('toast.askSettingsSaveFailed', '保存问答设置失败'), 'error'),
+  })
+
+  const routerMutation = useMutation({
+    mutationFn: (data: Record<string, unknown>) =>
+      settingsApi.routerSettingsUpdate(data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['settings', 'private'] })
+      queryClient.invalidateQueries({ queryKey: ['settings', 'audit-summary'] })
+      toast(t('toast.routerSettingsSaved', '路由设置已保存'), 'success')
+    },
+    onError: (err) =>
+      toast(err instanceof Error ? err.message : t('toast.routerSettingsSaveFailed', '保存路由设置失败'), 'error'),
+  })
+
   const routerRuntimeReloadMutation = useMutation({
     mutationFn: () => settingsApi.routerRuntimeReload(),
     onSuccess: () => {
@@ -222,7 +248,18 @@ export default function SettingsPage() {
               settings={settings}
               canSave={canUpdateSettings}
             />
-        )
+            )
+      case 'ask':
+        return (
+            <AskRouterSettings
+              settings={settings}
+              onSaveAsk={(s) => askMutation.mutate(s)}
+              onSaveRouter={(s) => routerMutation.mutate(s)}
+              savingAsk={askMutation.isPending}
+              savingRouter={routerMutation.isPending}
+              canSave={canUpdateSettings}
+            />
+            )
       case 'general':
         return (
           <div className="space-y-6">
@@ -248,7 +285,7 @@ export default function SettingsPage() {
       default:
         return <Skeleton className="h-40 w-full" />
     }
-  }, [activeTab, canReadSettings, isLoading, isError, settings, brandingMutation, themeMutation, llmMutation, generalMutation, routerRuntimeReloadMutation, languageMutation, canUpdateSettings, locale, refetch, t, queryClient])
+  }, [activeTab, canReadSettings, isLoading, isError, settings, brandingMutation, themeMutation, llmMutation, generalMutation, askMutation, routerMutation, routerRuntimeReloadMutation, languageMutation, canUpdateSettings, locale, refetch, t, queryClient])
 
   return (
     <div className="min-h-full rounded-xl border border-gray-200 bg-white p-2 dark:border-gray-700 dark:bg-gray-900">

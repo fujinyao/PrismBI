@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import uuid
 from urllib.parse import unquote
 
@@ -20,6 +21,50 @@ from services.step_progress import StepProgress, _STEP_KEYS
 LOGGER = logging.getLogger(__name__)
 
 _MAX_MSG_SIZE = 256 * 1024
+
+
+def _coerce_stream_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
+    raw = os.getenv(name)
+    try:
+        value = int(raw) if raw is not None else int(default)
+    except Exception:
+        value = int(default)
+    if value < minimum:
+        return minimum
+    if value > maximum:
+        return maximum
+    return value
+
+
+_STREAM_MIN_CHARS = _coerce_stream_int_env("PRISMBI_ASK_STREAM_MIN_CHARS", 48, 20, 400)
+_STREAM_MAX_CHARS = _coerce_stream_int_env("PRISMBI_ASK_STREAM_MAX_CHARS", 80, 20, 800)
+if _STREAM_MAX_CHARS < _STREAM_MIN_CHARS:
+    _STREAM_MAX_CHARS = _STREAM_MIN_CHARS
+_STREAM_FLUSH_MS = _coerce_stream_int_env("PRISMBI_ASK_STREAM_FLUSH_MS", 40, 0, 2000)
+_STREAM_FLUSH_SECONDS = float(_STREAM_FLUSH_MS) / 1000.0
+_CHUNK_BOUNDARY_CHARS = frozenset(
+    {
+        " ",
+        "\n",
+        "\t",
+        ",",
+        ".",
+        ";",
+        ":",
+        "!",
+        "?",
+        ")",
+        "]",
+        "}",
+        "\uFF0C",
+        "\u3002",
+        "\uFF1B",
+        "\uFF1A",
+        "\uFF01",
+        "\uFF1F",
+        "\u3001",
+    }
+)
 
 router = APIRouter()
 
@@ -152,15 +197,24 @@ def _parse_ws_data(raw: object) -> dict:
     return raw
 
 
-def _chunk_text(text: str, chunk_size: int = 12) -> list[str]:
+def _chunk_text(text: str, min_chars: int = _STREAM_MIN_CHARS, max_chars: int = _STREAM_MAX_CHARS) -> list[str]:
     if not text:
         return []
-    chunks = []
-    pos = 0
-    while pos < len(text):
-        end = min(pos + chunk_size, len(text))
-        chunks.append(text[pos:end])
-        pos = end
+    normalized_min = max(1, int(min_chars))
+    normalized_max = max(normalized_min, int(max_chars))
+    chunks: list[str] = []
+    buffer: list[str] = []
+    for ch in text:
+        buffer.append(ch)
+        length = len(buffer)
+        should_flush = length >= normalized_max
+        if not should_flush and length >= normalized_min and ch in _CHUNK_BOUNDARY_CHARS:
+            should_flush = True
+        if should_flush:
+            chunks.append("".join(buffer))
+            buffer = []
+    if buffer:
+        chunks.append("".join(buffer))
     return chunks
 
 
@@ -244,13 +298,13 @@ async def websocket_ask(websocket: WebSocket):
             sql = result.get("sql", "") or ""
 
             if answer:
-                chunks = _chunk_text(answer, chunk_size=12)
+                chunks = _chunk_text(answer)
                 for i, chunk in enumerate(chunks):
                     if websocket.client_state != WebSocketState.CONNECTED:
                         break
                     await _send_json_safe(websocket, {"type": "delta", "content_type": "text", "content": chunk, "request_id": request_id or None}, write_lock)
-                    if i < len(chunks) - 1:
-                        await asyncio.sleep(0.015)
+                    if i < len(chunks) - 1 and _STREAM_FLUSH_SECONDS > 0:
+                        await asyncio.sleep(_STREAM_FLUSH_SECONDS)
 
             if sql:
                 await _send_json_safe(websocket, {"type": "delta", "content_type": "sql", "content": sql, "request_id": request_id or None}, write_lock)

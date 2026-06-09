@@ -77,7 +77,15 @@ def test_generation_router_decisions_by_tier():
     router = GenerationRouter()
 
     simple = router.select_strategy({"tier": "simple"}, has_knowledge=False)
-    compound = router.select_strategy({"tier": "compound"}, has_knowledge=True)
+    compound = router.select_strategy(
+        {
+            "tier": "compound",
+            "sub_questions": ["top products", "city breakdown"],
+            "dimensions": ["product", "city"],
+            "metrics": ["sales", "orders"],
+        },
+        has_knowledge=True,
+    )
     decision = router.build_decision(
         requires_sql=True,
         metadata_question_part="m",
@@ -93,8 +101,58 @@ def test_generation_router_decisions_by_tier():
 
     assert simple.engine == "direct_llm"
     assert simple.use_examples is False
+    assert simple.mode == "adaptive_risk"
+    assert simple.policy == "risk_constrained_direct"
     assert compound.engine == "decompose_merge"
+    assert compound.mode == "adaptive_risk"
+    assert compound.policy == "risk_decompose_merge"
+    assert compound.risk_level == "high"
     assert decision.to_audit_payload()["fallback_count"] == 2
+
+
+def test_generation_router_adaptive_avoids_decompose_when_subquestions_do_not_support_it():
+    router = GenerationRouter()
+
+    selection = router.select_strategy(
+        {
+            "tier": "compound",
+            "sub_questions": ["top products"],
+            "dimensions": ["product", "city"],
+            "metrics": ["sales"],
+        },
+        has_knowledge=True,
+    )
+
+    assert selection.engine == "fewshot_cot"
+    assert selection.mode == "adaptive_risk"
+    assert selection.policy == "risk_consensus_fewshot"
+
+
+def test_generation_router_can_disable_adaptive_strategy_mode():
+    router = GenerationRouter(config_getter=lambda: {"adaptive_strategy_enabled": False})
+
+    selection = router.select_strategy({"tier": "compound"}, has_knowledge=True)
+
+    assert selection.engine == "decompose_merge"
+    assert selection.mode == "legacy_tier"
+    assert selection.policy == "tier_default"
+
+
+def test_generation_router_decompose_toggle_redirects_compound_strategy():
+    router = GenerationRouter(config_getter=lambda: {"decompose_merge_enabled": False})
+
+    selection = router.select_strategy(
+        {
+            "tier": "compound",
+            "sub_questions": ["top products", "city breakdown"],
+            "dimensions": ["product", "city"],
+        },
+        has_knowledge=True,
+    )
+
+    assert selection.engine == "fewshot_cot"
+    assert selection.policy == "decompose_disabled_fewshot"
+    assert selection.signals.get("decompose_enabled") == 0
 
 
 def test_generation_pipeline_prepare_context_with_no_hits_returns_early_result():

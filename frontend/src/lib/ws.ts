@@ -11,6 +11,12 @@ export interface WebSocketClient {
 const MAX_PENDING = 100
 const MAX_RECONNECT_ATTEMPTS = 10
 const PONG_TIMEOUT_MS = 90000
+const APP_HEARTBEAT_FLAG = String(process.env.NEXT_PUBLIC_WS_APP_HEARTBEAT_ENABLED ?? '0').trim().toLowerCase()
+const APP_HEARTBEAT_ENABLED = APP_HEARTBEAT_FLAG === '1' || APP_HEARTBEAT_FLAG === 'true' || APP_HEARTBEAT_FLAG === 'on'
+const HEARTBEAT_INTERVAL_RAW_MS = Number(process.env.NEXT_PUBLIC_WS_APP_HEARTBEAT_INTERVAL_MS ?? '30000')
+const HEARTBEAT_INTERVAL_MS = Number.isFinite(HEARTBEAT_INTERVAL_RAW_MS) && HEARTBEAT_INTERVAL_RAW_MS > 0
+  ? HEARTBEAT_INTERVAL_RAW_MS
+  : 30000
 
 const WS_TICKET_TIMEOUT_MS = 10000
 
@@ -61,12 +67,15 @@ export function createWebSocket(url: string, getToken: () => string, getTicket?:
 
   function startHeartbeat() {
     stopHeartbeat()
+    if (!APP_HEARTBEAT_ENABLED) {
+      return
+    }
     heartbeatTimer = setInterval(() => {
       if (ws?.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: 'ping' }))
         resetPongTimeout()
       }
-    }, 30000)
+    }, HEARTBEAT_INTERVAL_MS)
   }
 
   function stopHeartbeat() {
@@ -83,7 +92,7 @@ export function createWebSocket(url: string, getToken: () => string, getTicket?:
   async function connect() {
     if (destroyed) return
     state = 'connecting'
-    let wsUrl: string = url
+    const wsUrl: string = url
     let wsProtocols: string[] = []
     if (getTicket) {
       let ticket: string | null = null

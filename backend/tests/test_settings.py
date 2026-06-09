@@ -404,11 +404,19 @@ class TestUpdateSetting:
             "/api/settings/router",
             json={
                 "tier1_max_retries": 1,
+                "adaptive_strategy_enabled": False,
+                "adaptive_strategy_consensus_risk_threshold": 6,
+                "adaptive_strategy_decompose_risk_threshold": 5,
+                "adaptive_strategy_min_subquestions_for_decompose": 3,
                 "cross_source_max_workers": 3,
+                "decompose_merge_enabled": False,
                 "route_observability_max_events_per_project": 15000,
                 "route_observability_persist_enabled": True,
                 "route_observability_persist_interval_seconds": 15,
                 "route_observability_persist_event_delta": 5,
+                "route_observability_strategy_trend_max_points": 36,
+                "route_observability_strategy_trend_persist_interval_seconds": 20,
+                "route_observability_strategy_trend_persist_decision_delta": 3,
                 "sql_route_v2_enabled": True,
                 "sql_route_shadow_mode": True,
                 "sql_route_allowlist_projects": [1, 2],
@@ -422,11 +430,19 @@ class TestUpdateSetting:
         assert response.status_code == 200
         assert response.json()["data"]["success"] is True
         assert ask_service.ROUTER_CONFIG["tier1_max_retries"] == 1
+        assert ask_service.ROUTER_CONFIG["adaptive_strategy_enabled"] is False
+        assert ask_service.ROUTER_CONFIG["adaptive_strategy_consensus_risk_threshold"] == 6
+        assert ask_service.ROUTER_CONFIG["adaptive_strategy_decompose_risk_threshold"] == 6
+        assert ask_service.ROUTER_CONFIG["adaptive_strategy_min_subquestions_for_decompose"] == 3
         assert ask_service.ROUTER_CONFIG["cross_source_max_workers"] == 3
+        assert ask_service.ROUTER_CONFIG["decompose_merge_enabled"] is False
         assert ask_service.ROUTER_CONFIG["route_observability_max_events_per_project"] == 15000
         assert ask_service.ROUTER_CONFIG["route_observability_persist_enabled"] is True
         assert ask_service.ROUTER_CONFIG["route_observability_persist_interval_seconds"] == 15
         assert ask_service.ROUTER_CONFIG["route_observability_persist_event_delta"] == 5
+        assert ask_service.ROUTER_CONFIG["route_observability_strategy_trend_max_points"] == 36
+        assert ask_service.ROUTER_CONFIG["route_observability_strategy_trend_persist_interval_seconds"] == 20
+        assert ask_service.ROUTER_CONFIG["route_observability_strategy_trend_persist_decision_delta"] == 3
         assert ask_service.ROUTER_CONFIG["model_ref_case_sensitive"] is False
         assert ask_service.ROUTER_CONFIG["sql_route_v2_enabled"] is True
         assert ask_service.ROUTER_CONFIG["sql_route_shadow_mode"] is True

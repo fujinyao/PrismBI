@@ -701,6 +701,12 @@ def test_validate_duckdb_sql_syntax_detects_duplicate_aliases():
     assert "duplicate alias" in issues[0].lower()
 
 
+def test_validate_duckdb_sql_syntax_rewrites_bracket_quoted_identifiers():
+    issues = _validate_duckdb_sql_syntax("SELECT * FROM [schema].[table]")
+
+    assert issues == []
+
+
 def test_fuzzy_column_match_does_not_map_unrelated_tokens():
     candidates = {"customer_city", "seller_city", "product_category_name", "order_id"}
     assert _fuzzy_column_match("quantity", candidates) is None

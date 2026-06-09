@@ -8,8 +8,11 @@ import {
   aggregateQueryMetrics,
   evaluateRouteObservabilityAlerts,
   isProjectScopedMetricsEnabled,
+  normalizeStrategyTrendHistory,
   normalizeQueryMetricsRows,
   queryMetricsQueryKey,
+  summarizeStrategyTrend,
+  summarizeStrategyObservability,
 } from '@/lib/queryMetrics'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/Button'
@@ -33,6 +36,18 @@ function formatDecimal(value: number, locale: string, digits = 2): string {
 
 function formatRatioPercent(value: number, locale: string, digits = 1): string {
   return `${formatLocaleNumber(value * 100, locale, { maximumFractionDigits: digits })}%`
+}
+
+function formatSignedDecimal(value: number, locale: string, digits = 2): string {
+  const normalized = Number.isFinite(value) ? value : 0
+  const prefix = normalized > 0 ? '+' : ''
+  return `${prefix}${formatLocaleNumber(normalized, locale, { maximumFractionDigits: digits })}`
+}
+
+function formatSignedRatioPercent(value: number, locale: string, digits = 1): string {
+  const normalized = Number.isFinite(value) ? value : 0
+  const prefix = normalized > 0 ? '+' : ''
+  return `${prefix}${formatLocaleNumber(normalized * 100, locale, { maximumFractionDigits: digits })}%`
 }
 
 function toSafeCount(value: unknown): number {
@@ -100,6 +115,12 @@ function fallbackRateTone(rate: number, warningRate: number, criticalRate: numbe
   return 'text-emerald-600 dark:text-emerald-300'
 }
 
+function driftTone(level: 'stable' | 'warning' | 'critical'): string {
+  if (level === 'critical') return 'text-error dark:text-error-300'
+  if (level === 'warning') return 'text-amber-600 dark:text-amber-300'
+  return 'text-emerald-600 dark:text-emerald-300'
+}
+
 export function ExecutionHealthPanel({ projectId, className }: ExecutionHealthPanelProps) {
   const t = useI18nStore((s) => s.t)
   const locale = useI18nStore((s) => s.locale)
@@ -120,6 +141,11 @@ export function ExecutionHealthPanel({ projectId, className }: ExecutionHealthPa
   const totals = useMemo(() => aggregateQueryMetrics(rows), [rows])
   const routeDimensions = metricsQuery.data?.route_dimensions
   const llmHttpCircuit = metricsQuery.data?.llm_http_circuit
+  const strategyTrendHistory = useMemo(
+    () => normalizeStrategyTrendHistory(metricsQuery.data?.strategy_trend_history, 24),
+    [metricsQuery.data?.strategy_trend_history],
+  )
+
   const llmHttpCircuitOpenKeys = useMemo(() => {
     const value = Number(llmHttpCircuit?.open_keys)
     return Number.isFinite(value) ? Math.max(0, Math.round(value)) : 0
@@ -232,6 +258,36 @@ export function ExecutionHealthPanel({ projectId, className }: ExecutionHealthPa
     () => topCounterEntries(routeDimensions?.final_answer_fallback_reason, 3),
     [routeDimensions?.final_answer_fallback_reason],
   )
+  const strategySummary = useMemo(
+    () => summarizeStrategyObservability(routeDimensions),
+    [routeDimensions],
+  )
+  const topStrategyEngine = strategySummary.selectedEngines[0]
+  const topStrategyMode = strategySummary.modes[0]
+  const topStrategyPolicy = strategySummary.policies[0]
+  const topStrategyRiskLevel = strategySummary.riskLevels[0]
+  const hasStrategySignals =
+    strategySummary.decisionTotal > 0
+    || strategySummary.riskScoreTotal > 0
+    || strategySummary.selectedEngines.length > 0
+    || strategySummary.modes.length > 0
+    || strategySummary.policies.length > 0
+    || strategySummary.riskLevels.length > 0
+  const strategyTrendSummary = useMemo(
+    () => summarizeStrategyTrend(strategyTrendHistory),
+    [strategyTrendHistory],
+  )
+  const hasStrategyTrend = strategyTrendSummary.sampleCount >= 2
+  const strategyDriftLabel = useMemo(() => {
+    if (strategyTrendSummary.driftLevel === 'critical') {
+      return t('dashboard.health.strategyDriftCritical', 'Critical Drift')
+    }
+    if (strategyTrendSummary.driftLevel === 'warning') {
+      return t('dashboard.health.strategyDriftWarning', 'Warning Drift')
+    }
+    return t('dashboard.health.strategyDriftStable', 'Stable')
+  }, [strategyTrendSummary.driftLevel, t])
+
   const fallbackCards = [
     {
       key: 'schema-link',
@@ -394,6 +450,12 @@ export function ExecutionHealthPanel({ projectId, className }: ExecutionHealthPa
                           case 'final_answer_fallback_high':
                             label = t('dashboard.health.alert.finalAnswerFallbackHigh', 'Final answer fallback rate is elevated')
                             break
+                          case 'strategy_high_risk_rate':
+                            label = t('dashboard.health.alert.strategyHighRiskRate', 'High-risk strategy decisions are elevated')
+                            break
+                          case 'strategy_decompose_policy_high':
+                            label = t('dashboard.health.alert.strategyDecomposePolicyHigh', 'Decompose policy usage is elevated')
+                            break
                           default:
                             break
                         }
@@ -483,6 +545,194 @@ export function ExecutionHealthPanel({ projectId, className }: ExecutionHealthPa
                     </p>
                   </div>
                 </div>
+                {hasStrategySignals && (
+                  <div className="space-y-2 rounded-md border border-gray-200 bg-white px-3 py-2 dark:border-gray-700 dark:bg-gray-900/50">
+                    <p className="text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
+                      {t('dashboard.health.strategyRoutingTitle', 'Adaptive Strategy Routing')}
+                    </p>
+                    <div className="grid grid-cols-2 gap-[5px] lg:grid-cols-5">
+                      <div className="rounded-md border border-gray-200 bg-gray-50 px-3 py-2 dark:border-gray-700 dark:bg-gray-800/60">
+                        <p className="text-xs text-gray-500 dark:text-gray-400">
+                          {t('dashboard.health.strategyDecisions', 'Strategy Decisions')}
+                        </p>
+                        <p className="text-sm font-semibold text-gray-900 dark:text-gray-100">
+                          {formatCount(strategySummary.decisionTotal, locale)}
+                        </p>
+                      </div>
+                      <div className="rounded-md border border-gray-200 bg-gray-50 px-3 py-2 dark:border-gray-700 dark:bg-gray-800/60">
+                        <p className="text-xs text-gray-500 dark:text-gray-400">
+                          {t('dashboard.health.strategyRiskAvg', 'Risk Score Avg')}
+                        </p>
+                        <p className="text-sm font-semibold text-gray-900 dark:text-gray-100">
+                          {formatDecimal(strategySummary.riskScoreAvg, locale, 2)}
+                        </p>
+                      </div>
+                      <div className="rounded-md border border-gray-200 bg-gray-50 px-3 py-2 dark:border-gray-700 dark:bg-gray-800/60">
+                        <p className="text-xs text-gray-500 dark:text-gray-400">
+                          {t('dashboard.health.strategyRiskMax', 'Risk Score Max')}
+                        </p>
+                        <p className="text-sm font-semibold text-gray-900 dark:text-gray-100">
+                          {formatCount(strategySummary.riskScoreMax, locale)}
+                        </p>
+                      </div>
+                      <div className="rounded-md border border-gray-200 bg-gray-50 px-3 py-2 dark:border-gray-700 dark:bg-gray-800/60">
+                        <p className="text-xs text-gray-500 dark:text-gray-400">
+                          {t('dashboard.health.strategyTopMode', 'Top Mode')}
+                        </p>
+                        <p className="truncate text-sm font-semibold text-gray-900 dark:text-gray-100" title={topStrategyMode?.[0] || ''}>
+                          {topStrategyMode ? prettifyCounterKey(topStrategyMode[0]) : t('dashboard.health.none', 'None')}
+                        </p>
+                        <p className="text-[11px] text-gray-500 dark:text-gray-400">
+                          {formatCount(topStrategyMode?.[1] || 0, locale)}
+                        </p>
+                      </div>
+                      <div className="rounded-md border border-gray-200 bg-gray-50 px-3 py-2 dark:border-gray-700 dark:bg-gray-800/60">
+                        <p className="text-xs text-gray-500 dark:text-gray-400">
+                          {t('dashboard.health.strategyTopPolicy', 'Top Policy')}
+                        </p>
+                        <p className="truncate text-sm font-semibold text-gray-900 dark:text-gray-100" title={topStrategyPolicy?.[0] || ''}>
+                          {topStrategyPolicy ? prettifyCounterKey(topStrategyPolicy[0]) : t('dashboard.health.none', 'None')}
+                        </p>
+                        <p className="text-[11px] text-gray-500 dark:text-gray-400">
+                          {formatCount(topStrategyPolicy?.[1] || 0, locale)}
+                        </p>
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-1 gap-2 lg:grid-cols-4">
+                      <div className="rounded-md border border-gray-200 bg-gray-50 px-3 py-2 dark:border-gray-700 dark:bg-gray-800/60">
+                        <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
+                          {t('dashboard.health.strategyEngines', 'Selected Engines')}
+                        </p>
+                        {strategySummary.selectedEngines.length === 0 ? (
+                          <p className="text-xs text-gray-500 dark:text-gray-400">{t('dashboard.health.none', 'None')}</p>
+                        ) : (
+                          <div className="space-y-1">
+                            {strategySummary.selectedEngines.map(([engine, count]) => (
+                              <div key={engine} className="flex items-center justify-between text-xs text-gray-700 dark:text-gray-300">
+                                <span className="truncate pr-2">{prettifyCounterKey(engine)}</span>
+                                <span className="font-medium">{formatCount(count, locale)}</span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                      <div className="rounded-md border border-gray-200 bg-gray-50 px-3 py-2 dark:border-gray-700 dark:bg-gray-800/60">
+                        <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
+                          {t('dashboard.health.strategyModes', 'Strategy Modes')}
+                        </p>
+                        {strategySummary.modes.length === 0 ? (
+                          <p className="text-xs text-gray-500 dark:text-gray-400">{t('dashboard.health.none', 'None')}</p>
+                        ) : (
+                          <div className="space-y-1">
+                            {strategySummary.modes.map(([mode, count]) => (
+                              <div key={mode} className="flex items-center justify-between text-xs text-gray-700 dark:text-gray-300">
+                                <span className="truncate pr-2">{prettifyCounterKey(mode)}</span>
+                                <span className="font-medium">{formatCount(count, locale)}</span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                      <div className="rounded-md border border-gray-200 bg-gray-50 px-3 py-2 dark:border-gray-700 dark:bg-gray-800/60">
+                        <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
+                          {t('dashboard.health.strategyPolicies', 'Strategy Policies')}
+                        </p>
+                        {strategySummary.policies.length === 0 ? (
+                          <p className="text-xs text-gray-500 dark:text-gray-400">{t('dashboard.health.none', 'None')}</p>
+                        ) : (
+                          <div className="space-y-1">
+                            {strategySummary.policies.map(([policy, count]) => (
+                              <div key={policy} className="flex items-center justify-between text-xs text-gray-700 dark:text-gray-300">
+                                <span className="truncate pr-2">{prettifyCounterKey(policy)}</span>
+                                <span className="font-medium">{formatCount(count, locale)}</span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                      <div className="rounded-md border border-gray-200 bg-gray-50 px-3 py-2 dark:border-gray-700 dark:bg-gray-800/60">
+                        <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
+                          {t('dashboard.health.strategyRiskLevels', 'Risk Levels')}
+                        </p>
+                        {strategySummary.riskLevels.length === 0 ? (
+                          <p className="text-xs text-gray-500 dark:text-gray-400">{t('dashboard.health.none', 'None')}</p>
+                        ) : (
+                          <div className="space-y-1">
+                            {strategySummary.riskLevels.map(([level, count]) => (
+                              <div key={level} className="flex items-center justify-between text-xs text-gray-700 dark:text-gray-300">
+                                <span className="truncate pr-2">{prettifyCounterKey(level)}</span>
+                                <span className="font-medium">{formatCount(count, locale)}</span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                    <p className="text-[11px] text-gray-500 dark:text-gray-400">
+                      {t('dashboard.health.strategyTopEngine', 'Top selected engine')}: {topStrategyEngine ? `${prettifyCounterKey(topStrategyEngine[0])} (${formatCount(topStrategyEngine[1], locale)})` : t('dashboard.health.none', 'None')}
+                      {' · '}
+                      {t('dashboard.health.strategyTopRiskLevel', 'Top risk level')}: {topStrategyRiskLevel ? `${prettifyCounterKey(topStrategyRiskLevel[0])} (${formatCount(topStrategyRiskLevel[1], locale)})` : t('dashboard.health.none', 'None')}
+                    </p>
+                    <div className="rounded-md border border-gray-200 bg-gray-50 px-3 py-2 dark:border-gray-700 dark:bg-gray-800/60">
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
+                          {t('dashboard.health.strategyDriftTitle', 'Strategy Drift')}
+                        </p>
+                        <span className={cn('text-xs font-semibold', driftTone(strategyTrendSummary.driftLevel))}>
+                          {strategyDriftLabel}
+                        </span>
+                      </div>
+                      {hasStrategyTrend ? (
+                        <div className="mt-2 grid grid-cols-2 gap-[5px] lg:grid-cols-5">
+                          <div className="rounded-md border border-gray-200 bg-white px-3 py-2 dark:border-gray-700 dark:bg-gray-900/60">
+                            <p className="text-[11px] text-gray-500 dark:text-gray-400">
+                              {t('dashboard.health.strategyDriftHorizon', 'Horizon')}
+                            </p>
+                            <p className="text-sm font-semibold text-gray-900 dark:text-gray-100">
+                              {formatDecimal(strategyTrendSummary.horizonMinutes, locale, 1)}m
+                            </p>
+                          </div>
+                          <div className="rounded-md border border-gray-200 bg-white px-3 py-2 dark:border-gray-700 dark:bg-gray-900/60">
+                            <p className="text-[11px] text-gray-500 dark:text-gray-400">
+                              {t('dashboard.health.strategyRiskDelta', 'Risk Avg Delta')}
+                            </p>
+                            <p className={cn('text-sm font-semibold', driftTone(strategyTrendSummary.riskScoreDelta > 0 ? strategyTrendSummary.driftLevel : 'stable'))}>
+                              {formatSignedDecimal(strategyTrendSummary.riskScoreDelta, locale, 2)}
+                            </p>
+                          </div>
+                          <div className="rounded-md border border-gray-200 bg-white px-3 py-2 dark:border-gray-700 dark:bg-gray-900/60">
+                            <p className="text-[11px] text-gray-500 dark:text-gray-400">
+                              {t('dashboard.health.strategyHighRiskDelta', 'High-Risk Delta')}
+                            </p>
+                            <p className={cn('text-sm font-semibold', driftTone(strategyTrendSummary.highRiskRateDelta > 0 ? strategyTrendSummary.driftLevel : 'stable'))}>
+                              {formatSignedRatioPercent(strategyTrendSummary.highRiskRateDelta, locale, 1)}
+                            </p>
+                          </div>
+                          <div className="rounded-md border border-gray-200 bg-white px-3 py-2 dark:border-gray-700 dark:bg-gray-900/60">
+                            <p className="text-[11px] text-gray-500 dark:text-gray-400">
+                              {t('dashboard.health.strategyDecomposeDelta', 'Decompose Delta')}
+                            </p>
+                            <p className={cn('text-sm font-semibold', driftTone(strategyTrendSummary.decomposePolicyRateDelta > 0 ? strategyTrendSummary.driftLevel : 'stable'))}>
+                              {formatSignedRatioPercent(strategyTrendSummary.decomposePolicyRateDelta, locale, 1)}
+                            </p>
+                          </div>
+                          <div className="rounded-md border border-gray-200 bg-white px-3 py-2 dark:border-gray-700 dark:bg-gray-900/60">
+                            <p className="text-[11px] text-gray-500 dark:text-gray-400">
+                              {t('dashboard.health.strategyModeSwitches', 'Mode/Policy Switches')}
+                            </p>
+                            <p className="text-sm font-semibold text-gray-900 dark:text-gray-100">
+                              {formatCount(strategyTrendSummary.modeSwitches, locale)} / {formatCount(strategyTrendSummary.policySwitches, locale)}
+                            </p>
+                          </div>
+                        </div>
+                      ) : (
+                        <p className="mt-2 text-xs text-gray-500 dark:text-gray-400">
+                          {t('dashboard.health.strategyDriftNeedMoreSamples', 'Collecting trend samples. Refresh cycles will populate drift metrics.')}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                )}
                 <div className="grid grid-cols-1 gap-2 lg:grid-cols-3">
                   {fallbackCards.map((card) => (
                     <div key={card.key} className="rounded-md border border-gray-200 bg-white px-3 py-2 dark:border-gray-700 dark:bg-gray-900/50">

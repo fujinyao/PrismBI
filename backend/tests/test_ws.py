@@ -58,6 +58,16 @@ def test_ws_ask_accepts_token_subprotocol(test_app: TestClient, auth_headers: di
         assert websocket.receive_json() == {"type": "pong"}
 
 
+def test_ws_chunk_text_uses_windowed_chunk_sizes():
+    from routers import ws as ws_router
+
+    chunks = ws_router._chunk_text("a" * 150, min_chars=48, max_chars=80)
+
+    assert len(chunks) == 2
+    assert len(chunks[0]) == 80
+    assert len(chunks[1]) == 70
+
+
 def test_ws_ask_temporary_returns_result(test_app: TestClient, auth_headers: dict, test_db):
     before_threads = test_db.execute("SELECT COUNT(*) FROM metadata.threads").fetchone()[0]
     token = auth_headers["Authorization"].removeprefix("Bearer ")

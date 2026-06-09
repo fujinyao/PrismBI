@@ -41,6 +41,7 @@ uvicorn main:app \
   --port 8400 \
   --reload \
   --reload-dir "$BACKEND_DIR" \
+  --env-file .env \
   --log-level info &
 BACKEND_PID=$!
 

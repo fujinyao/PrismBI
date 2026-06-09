@@ -1,11 +1,16 @@
 import { describe, expect, it } from 'vitest'
-import type { QueryRouteDimensions } from '@/lib/api'
+import type { QueryRouteDimensions, QueryStrategyTrendPoint } from '@/lib/api'
 import {
   aggregateQueryMetrics,
+  appendStrategyTrendPoint,
+  buildStrategyTrendPoint,
   evaluateRouteObservabilityAlerts,
   isProjectScopedMetricsEnabled,
+  normalizeStrategyTrendHistory,
   normalizeQueryMetricsRows,
   queryMetricsQueryKey,
+  summarizeStrategyTrend,
+  summarizeStrategyObservability,
 } from '@/lib/queryMetrics'
 
 function buildRouteDimensions(overrides: Partial<QueryRouteDimensions> = {}): QueryRouteDimensions {
@@ -13,6 +18,13 @@ function buildRouteDimensions(overrides: Partial<QueryRouteDimensions> = {}): Qu
     events_total: 0,
     route_kind: {},
     generation_engine: {},
+    strategy_selected_engine: {},
+    strategy_mode: {},
+    strategy_policy: {},
+    strategy_risk_level: {},
+    strategy_risk_score_total: 0,
+    strategy_risk_score_avg: 0,
+    strategy_risk_score_max: 0,
     strict_json_mode: {},
     generation_decision_total: 0,
     fallback_count_total: 0,
@@ -260,6 +272,32 @@ describe('queryMetrics helpers', () => {
     expect(alerts).toEqual([])
   })
 
+  it('raises strategy warning alerts when risk and decompose share are elevated', () => {
+    const alerts = evaluateRouteObservabilityAlerts(buildRouteDimensions({
+      generation_decision_total: 20,
+      strategy_risk_level: { high: 6, medium: 10, low: 4 },
+      strategy_policy: { risk_decompose_merge: 7, risk_consensus_fewshot: 8, risk_constrained_direct: 5 },
+    }))
+
+    expect(alerts).toEqual([
+      { id: 'strategy_decompose_policy_high', level: 'warning', count: 7, threshold: 6 },
+      { id: 'strategy_high_risk_rate', level: 'warning', count: 6, threshold: 5 },
+    ])
+  })
+
+  it('raises strategy critical alerts when risk and decompose share are severe', () => {
+    const alerts = evaluateRouteObservabilityAlerts(buildRouteDimensions({
+      generation_decision_total: 20,
+      strategy_risk_level: { high: 10, medium: 7, low: 3 },
+      strategy_policy: { risk_decompose_merge: 12, risk_consensus_fewshot: 5, risk_constrained_direct: 3 },
+    }))
+
+    expect(alerts).toEqual([
+      { id: 'strategy_decompose_policy_high', level: 'critical', count: 12, threshold: 11 },
+      { id: 'strategy_high_risk_rate', level: 'critical', count: 10, threshold: 9 },
+    ])
+  })
+
   it('raises warning when llm http circuit has open keys', () => {
     const alerts = evaluateRouteObservabilityAlerts(
       buildRouteDimensions({ events_total: 5 }),
@@ -294,5 +332,262 @@ describe('queryMetrics helpers', () => {
     expect(alerts).toEqual([
       { id: 'llm_http_circuit_open', level: 'critical', count: 3, threshold: 3 },
     ])
+  })
+
+  it('summarizes adaptive strategy routing counters and risk scores', () => {
+    const summary = summarizeStrategyObservability(buildRouteDimensions({
+      generation_decision_total: 0,
+      generation_engine: { direct_llm: 8 },
+      strategy_selected_engine: { fewshot_cot: 5, direct_llm: 3 },
+      strategy_mode: { adaptive_risk: 7, legacy_tier: 1 },
+      strategy_policy: { risk_consensus_fewshot: 4, risk_constrained_direct: 3, tier_default: 1 },
+      strategy_risk_level: { medium: 5, low: 2, high: 1 },
+      strategy_risk_score_total: 42,
+      strategy_risk_score_max: 9,
+    }))
+
+    expect(summary.decisionTotal).toBe(8)
+    expect(summary.riskScoreTotal).toBe(42)
+    expect(summary.riskScoreAvg).toBe(5.25)
+    expect(summary.riskScoreMax).toBe(9)
+    expect(summary.selectedEngines[0]).toEqual(['fewshot_cot', 5])
+    expect(summary.modes[0]).toEqual(['adaptive_risk', 7])
+    expect(summary.policies[0]).toEqual(['risk_consensus_fewshot', 4])
+    expect(summary.riskLevels[0]).toEqual(['medium', 5])
+  })
+
+  it('uses payload average risk score when totals are missing', () => {
+    const summary = summarizeStrategyObservability(buildRouteDimensions({
+      strategy_risk_score_total: 0,
+      strategy_risk_score_avg: 3.67,
+      strategy_risk_score_max: 6,
+    }))
+
+    expect(summary.decisionTotal).toBe(0)
+    expect(summary.riskScoreAvg).toBe(3.67)
+    expect(summary.riskScoreMax).toBe(6)
+  })
+
+  it('builds a trend point from route dimensions with decision volume', () => {
+    const point = buildStrategyTrendPoint(
+      buildRouteDimensions({
+        generation_decision_total: 20,
+        strategy_risk_level: { high: 6, medium: 10, low: 4 },
+        strategy_policy: { risk_decompose_merge: 7, risk_consensus_fewshot: 8, risk_constrained_direct: 5 },
+        strategy_mode: { adaptive_risk: 14, legacy_tier: 6 },
+      }),
+      12345,
+    )
+
+    expect(point).toEqual({
+      capturedAtMs: 12345,
+      decisionTotal: 20,
+      riskScoreAvg: 0,
+      highRiskRate: 0.3,
+      decomposePolicyRate: 0.35,
+      dominantMode: 'adaptive_risk',
+      dominantPolicy: 'risk_consensus_fewshot',
+    })
+  })
+
+  it('returns null trend point when there are no strategy decisions', () => {
+    const point = buildStrategyTrendPoint(buildRouteDimensions({ generation_decision_total: 0 }), 1000)
+    expect(point).toBeNull()
+  })
+
+  it('appends trend points with de-duplication and bounded history', () => {
+    const first = {
+      capturedAtMs: 1000,
+      decisionTotal: 10,
+      riskScoreAvg: 2,
+      highRiskRate: 0.1,
+      decomposePolicyRate: 0.2,
+      dominantMode: 'adaptive_risk',
+      dominantPolicy: 'risk_consensus_fewshot',
+    }
+    const duplicate = { ...first, capturedAtMs: 2000 }
+    const next = {
+      capturedAtMs: 3000,
+      decisionTotal: 10,
+      riskScoreAvg: 2.5,
+      highRiskRate: 0.2,
+      decomposePolicyRate: 0.3,
+      dominantMode: 'adaptive_risk',
+      dominantPolicy: 'risk_decompose_merge',
+    }
+
+    const withFirst = appendStrategyTrendPoint([], first, 3)
+    const deduped = appendStrategyTrendPoint(withFirst, duplicate, 3)
+    const withSecond = appendStrategyTrendPoint(deduped, next, 3)
+    const bounded = appendStrategyTrendPoint(withSecond, { ...next, capturedAtMs: 4000, riskScoreAvg: 2.8 }, 2)
+
+    expect(withFirst).toHaveLength(1)
+    expect(deduped).toHaveLength(1)
+    expect(withSecond).toHaveLength(2)
+    expect(bounded).toHaveLength(2)
+    expect(bounded[0]?.capturedAtMs).toBe(3000)
+    expect(bounded[1]?.capturedAtMs).toBe(4000)
+  })
+
+  it('normalizes backend strategy trend history payloads', () => {
+    const rawHistory: QueryStrategyTrendPoint[] = [
+      {
+        captured_at_unix: 3,
+        decision_total: 12,
+        risk_score_avg: 2.81,
+        high_risk_rate: 0.23,
+        decompose_policy_rate: 0.31,
+        dominant_mode: 'Adaptive_Risk',
+        dominant_policy: 'Risk_Consensus_Fewshot',
+      },
+      {
+        captured_at_unix: 1,
+        decision_total: 10,
+        risk_score_avg: 1.5,
+        high_risk_rate: 0.1,
+        decompose_policy_rate: 0.2,
+        dominant_mode: 'legacy_tier',
+        dominant_policy: 'tier_default',
+      },
+      {
+        captured_at_unix: 2,
+        decision_total: 0,
+        risk_score_avg: 9,
+        high_risk_rate: 1,
+        decompose_policy_rate: 1,
+        dominant_mode: 'bad',
+        dominant_policy: 'bad',
+      },
+      {
+        captured_at_unix: Number.NaN,
+        decision_total: 4,
+        risk_score_avg: 1,
+        high_risk_rate: 0.2,
+        decompose_policy_rate: 0.2,
+        dominant_mode: 'bad',
+        dominant_policy: 'bad',
+      },
+    ]
+
+    const normalized = normalizeStrategyTrendHistory(rawHistory, 3)
+
+    expect(normalized).toEqual([
+      {
+        capturedAtMs: 1000,
+        decisionTotal: 10,
+        riskScoreAvg: 1.5,
+        highRiskRate: 0.1,
+        decomposePolicyRate: 0.2,
+        dominantMode: 'legacy_tier',
+        dominantPolicy: 'tier_default',
+      },
+      {
+        capturedAtMs: 3000,
+        decisionTotal: 12,
+        riskScoreAvg: 2.81,
+        highRiskRate: 0.23,
+        decomposePolicyRate: 0.31,
+        dominantMode: 'adaptive_risk',
+        dominantPolicy: 'risk_consensus_fewshot',
+      },
+    ])
+  })
+
+  it('summarizes trend drift levels from strategy trend history', () => {
+    const warningSummary = summarizeStrategyTrend([
+      {
+        capturedAtMs: 1000,
+        decisionTotal: 20,
+        riskScoreAvg: 2.0,
+        highRiskRate: 0.1,
+        decomposePolicyRate: 0.2,
+        dominantMode: 'adaptive_risk',
+        dominantPolicy: 'risk_consensus_fewshot',
+      },
+      {
+        capturedAtMs: 4000,
+        decisionTotal: 20,
+        riskScoreAvg: 2.9,
+        highRiskRate: 0.19,
+        decomposePolicyRate: 0.31,
+        dominantMode: 'legacy_tier',
+        dominantPolicy: 'risk_decompose_merge',
+      },
+    ])
+    const criticalSummary = summarizeStrategyTrend([
+      {
+        capturedAtMs: 1000,
+        decisionTotal: 20,
+        riskScoreAvg: 1.8,
+        highRiskRate: 0.1,
+        decomposePolicyRate: 0.2,
+        dominantMode: 'adaptive_risk',
+        dominantPolicy: 'risk_constrained_direct',
+      },
+      {
+        capturedAtMs: 8000,
+        decisionTotal: 20,
+        riskScoreAvg: 3.7,
+        highRiskRate: 0.3,
+        decomposePolicyRate: 0.45,
+        dominantMode: 'legacy_tier',
+        dominantPolicy: 'risk_consensus_fewshot',
+      },
+      {
+        capturedAtMs: 14000,
+        decisionTotal: 20,
+        riskScoreAvg: 4.4,
+        highRiskRate: 0.4,
+        decomposePolicyRate: 0.55,
+        dominantMode: 'adaptive_risk',
+        dominantPolicy: 'risk_decompose_merge',
+      },
+      {
+        capturedAtMs: 20000,
+        decisionTotal: 20,
+        riskScoreAvg: 4.8,
+        highRiskRate: 0.46,
+        decomposePolicyRate: 0.62,
+        dominantMode: 'legacy_tier',
+        dominantPolicy: 'risk_constrained_direct',
+      },
+      {
+        capturedAtMs: 26000,
+        decisionTotal: 20,
+        riskScoreAvg: 5.1,
+        highRiskRate: 0.5,
+        decomposePolicyRate: 0.68,
+        dominantMode: 'adaptive_risk',
+        dominantPolicy: 'risk_decompose_merge',
+      },
+    ])
+
+    expect(warningSummary.driftLevel).toBe('warning')
+    expect(warningSummary.modeSwitches).toBe(1)
+    expect(warningSummary.policySwitches).toBe(1)
+    expect(warningSummary.riskScoreDelta).toBe(0.9)
+    expect(warningSummary.highRiskRateDelta).toBe(0.09)
+    expect(criticalSummary.driftLevel).toBe('critical')
+    expect(criticalSummary.modeSwitches).toBe(4)
+    expect(criticalSummary.policySwitches).toBe(4)
+    expect(criticalSummary.riskScoreDelta).toBe(3.3)
+    expect(criticalSummary.highRiskRateDelta).toBe(0.4)
+  })
+
+  it('returns stable trend summary defaults for empty history', () => {
+    const summary = summarizeStrategyTrend([])
+
+    expect(summary).toEqual({
+      sampleCount: 0,
+      horizonMinutes: 0,
+      modeSwitches: 0,
+      policySwitches: 0,
+      riskScoreDelta: 0,
+      highRiskRateDelta: 0,
+      decomposePolicyRateDelta: 0,
+      currentDominantMode: '',
+      currentDominantPolicy: '',
+      driftLevel: 'stable',
+    })
   })
 })

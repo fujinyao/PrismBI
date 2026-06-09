@@ -3,6 +3,7 @@ import type {
   QueryExecutionMetrics,
   QueryLLMHttpCircuitSnapshot,
   QueryRouteDimensions,
+  QueryStrategyTrendPoint,
 } from '@/lib/api'
 
 export interface QueryMetricsRow {
@@ -30,6 +31,40 @@ export interface QueryMetricsSummary {
   avgRows: number
 }
 
+export interface StrategyObservabilitySummary {
+  decisionTotal: number
+  riskScoreTotal: number
+  riskScoreAvg: number
+  riskScoreMax: number
+  selectedEngines: Array<[string, number]>
+  modes: Array<[string, number]>
+  policies: Array<[string, number]>
+  riskLevels: Array<[string, number]>
+}
+
+export interface StrategyTrendPoint {
+  capturedAtMs: number
+  decisionTotal: number
+  riskScoreAvg: number
+  highRiskRate: number
+  decomposePolicyRate: number
+  dominantMode: string
+  dominantPolicy: string
+}
+
+export interface StrategyTrendSummary {
+  sampleCount: number
+  horizonMinutes: number
+  modeSwitches: number
+  policySwitches: number
+  riskScoreDelta: number
+  highRiskRateDelta: number
+  decomposePolicyRateDelta: number
+  currentDominantMode: string
+  currentDominantPolicy: string
+  driftLevel: 'stable' | 'warning' | 'critical'
+}
+
 export interface RouteObservabilityAlert {
   id:
     | 'duplicate_alias'
@@ -40,6 +75,8 @@ export interface RouteObservabilityAlert {
     | 'schema_link_fallback_high'
     | 'sql_generation_fallback_high'
     | 'final_answer_fallback_high'
+    | 'strategy_high_risk_rate'
+    | 'strategy_decompose_policy_high'
   level: 'warning' | 'critical'
   count: number
   threshold: number
@@ -86,6 +123,14 @@ function sumCounterValues(counter: Record<string, number> | undefined): number {
   return Object.values(counter ?? {}).reduce((total, value) => {
     return total + toSafeCount(value)
   }, 0)
+}
+
+function sortedCounterEntries(counter: Record<string, number> | undefined, limit = 3): Array<[string, number]> {
+  return Object.entries(counter ?? {})
+    .map(([key, value]) => [String(key), toSafeCount(value)] as [string, number])
+    .filter(([, value]) => value > 0)
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, limit)
 }
 
 function resolveFallbackTotal(
@@ -251,6 +296,13 @@ export function evaluateRouteObservabilityAlerts(
     routeDimensions?.final_answer_fallback_rate,
     generationDecisionTotal,
   )
+  const strategySummary = summarizeStrategyObservability(routeDimensions)
+  const strategyDecisionTotal = strategySummary.decisionTotal
+  const strategyHighRiskCount = toSafeCount(routeDimensions?.strategy_risk_level?.high)
+  const strategyDecomposePolicyCount = Math.max(
+    toSafeCount(routeDimensions?.strategy_policy?.risk_decompose_merge),
+    toSafeCount(routeDimensions?.strategy_policy?.decompose_merge),
+  )
 
   const alerts: RouteObservabilityAlert[] = []
 
@@ -330,9 +382,231 @@ export function evaluateRouteObservabilityAlerts(
     criticalRate: 0.25,
   })
 
+  if (strategyDecisionTotal >= 12) {
+    const highRiskWarningThreshold = Math.max(1, Math.ceil(strategyDecisionTotal * 0.25))
+    const highRiskCriticalThreshold = Math.max(
+      highRiskWarningThreshold + 1,
+      Math.ceil(strategyDecisionTotal * 0.45),
+    )
+    if (strategyDecisionTotal >= 20 && strategyHighRiskCount >= highRiskCriticalThreshold) {
+      alerts.push({
+        id: 'strategy_high_risk_rate',
+        level: 'critical',
+        count: strategyHighRiskCount,
+        threshold: highRiskCriticalThreshold,
+      })
+    } else if (strategyHighRiskCount >= highRiskWarningThreshold) {
+      alerts.push({
+        id: 'strategy_high_risk_rate',
+        level: 'warning',
+        count: strategyHighRiskCount,
+        threshold: highRiskWarningThreshold,
+      })
+    }
+  }
+
+  if (strategyDecisionTotal >= 10) {
+    const decomposeWarningThreshold = Math.max(1, Math.ceil(strategyDecisionTotal * 0.3))
+    const decomposeCriticalThreshold = Math.max(
+      decomposeWarningThreshold + 1,
+      Math.ceil(strategyDecisionTotal * 0.55),
+    )
+    if (strategyDecisionTotal >= 20 && strategyDecomposePolicyCount >= decomposeCriticalThreshold) {
+      alerts.push({
+        id: 'strategy_decompose_policy_high',
+        level: 'critical',
+        count: strategyDecomposePolicyCount,
+        threshold: decomposeCriticalThreshold,
+      })
+    } else if (strategyDecomposePolicyCount >= decomposeWarningThreshold) {
+      alerts.push({
+        id: 'strategy_decompose_policy_high',
+        level: 'warning',
+        count: strategyDecomposePolicyCount,
+        threshold: decomposeWarningThreshold,
+      })
+    }
+  }
+
   return alerts.sort((a, b) => {
     if (a.level !== b.level) return a.level === 'critical' ? -1 : 1
     if (b.count !== a.count) return b.count - a.count
     return a.id.localeCompare(b.id)
   })
+}
+
+export function summarizeStrategyObservability(
+  routeDimensions: QueryRouteDimensions | null | undefined,
+): StrategyObservabilitySummary {
+  const decisionTotal = Math.max(
+    toSafeCount(routeDimensions?.generation_decision_total),
+    sumCounterValues(routeDimensions?.generation_engine),
+    sumCounterValues(routeDimensions?.strategy_selected_engine),
+    sumCounterValues(routeDimensions?.strategy_mode),
+    sumCounterValues(routeDimensions?.strategy_policy),
+  )
+  const riskScoreTotal = toSafeCount(routeDimensions?.strategy_risk_score_total)
+  const riskScoreAvgFromPayload = Math.max(0, toFiniteNumber(routeDimensions?.strategy_risk_score_avg))
+  const riskScoreAvg = decisionTotal > 0 && riskScoreTotal > 0
+    ? round2(riskScoreTotal / decisionTotal)
+    : round2(riskScoreAvgFromPayload)
+
+  return {
+    decisionTotal,
+    riskScoreTotal,
+    riskScoreAvg,
+    riskScoreMax: toSafeCount(routeDimensions?.strategy_risk_score_max),
+    selectedEngines: sortedCounterEntries(routeDimensions?.strategy_selected_engine, 4),
+    modes: sortedCounterEntries(routeDimensions?.strategy_mode, 4),
+    policies: sortedCounterEntries(routeDimensions?.strategy_policy, 4),
+    riskLevels: sortedCounterEntries(routeDimensions?.strategy_risk_level, 4),
+  }
+}
+
+export function buildStrategyTrendPoint(
+  routeDimensions: QueryRouteDimensions | null | undefined,
+  capturedAtMs: number = Date.now(),
+): StrategyTrendPoint | null {
+  const summary = summarizeStrategyObservability(routeDimensions)
+  if (summary.decisionTotal <= 0) return null
+
+  const highRiskCount = toSafeCount(routeDimensions?.strategy_risk_level?.high)
+  const decomposePolicyCount = Math.max(
+    toSafeCount(routeDimensions?.strategy_policy?.risk_decompose_merge),
+    toSafeCount(routeDimensions?.strategy_policy?.decompose_merge),
+  )
+
+  return {
+    capturedAtMs: Math.max(0, Math.round(toFiniteNumber(capturedAtMs))),
+    decisionTotal: summary.decisionTotal,
+    riskScoreAvg: round2(summary.riskScoreAvg),
+    highRiskRate: summary.decisionTotal > 0 ? toSafeRate(highRiskCount / summary.decisionTotal) : 0,
+    decomposePolicyRate: summary.decisionTotal > 0 ? toSafeRate(decomposePolicyCount / summary.decisionTotal) : 0,
+    dominantMode: summary.modes[0]?.[0] ?? '',
+    dominantPolicy: summary.policies[0]?.[0] ?? '',
+  }
+}
+
+export function appendStrategyTrendPoint(
+  history: StrategyTrendPoint[],
+  point: StrategyTrendPoint,
+  maxPoints = 20,
+): StrategyTrendPoint[] {
+  const normalizedHistory = Array.isArray(history) ? history : []
+  const limit = Math.max(2, toSafeCount(maxPoints || 20))
+  const last = normalizedHistory[normalizedHistory.length - 1]
+  if (last) {
+    const unchanged =
+      last.decisionTotal === point.decisionTotal
+      && Math.abs(last.riskScoreAvg - point.riskScoreAvg) < 0.01
+      && Math.abs(last.highRiskRate - point.highRiskRate) < 0.001
+      && Math.abs(last.decomposePolicyRate - point.decomposePolicyRate) < 0.001
+      && last.dominantMode === point.dominantMode
+      && last.dominantPolicy === point.dominantPolicy
+    if (unchanged) {
+      return normalizedHistory
+    }
+  }
+  const next = [...normalizedHistory, point]
+  if (next.length <= limit) return next
+  return next.slice(next.length - limit)
+}
+
+export function normalizeStrategyTrendHistory(
+  history: QueryStrategyTrendPoint[] | null | undefined,
+  maxPoints = 24,
+): StrategyTrendPoint[] {
+  const limit = Math.max(2, toSafeCount(maxPoints || 24))
+  const normalized = (Array.isArray(history) ? history : [])
+    .map((item) => {
+      const capturedAtMs = Math.max(0, Math.round(toFiniteNumber(item?.captured_at_unix) * 1000))
+      const decisionTotal = toSafeCount(item?.decision_total)
+      return {
+        capturedAtMs,
+        decisionTotal,
+        riskScoreAvg: round2(Math.max(0, toFiniteNumber(item?.risk_score_avg))),
+        highRiskRate: toSafeRate(item?.high_risk_rate),
+        decomposePolicyRate: toSafeRate(item?.decompose_policy_rate),
+        dominantMode: String(item?.dominant_mode ?? '').trim().toLowerCase(),
+        dominantPolicy: String(item?.dominant_policy ?? '').trim().toLowerCase(),
+      }
+    })
+    .filter((item) => item.capturedAtMs > 0 && item.decisionTotal > 0)
+    .sort((a, b) => a.capturedAtMs - b.capturedAtMs)
+
+  return normalized.reduce<StrategyTrendPoint[]>((acc, point) => {
+    return appendStrategyTrendPoint(acc, point, limit)
+  }, [])
+}
+
+export function summarizeStrategyTrend(history: StrategyTrendPoint[]): StrategyTrendSummary {
+  const points = (Array.isArray(history) ? history : []).filter((item) => {
+    return item && Number.isFinite(item.capturedAtMs) && item.capturedAtMs > 0
+  })
+  if (points.length === 0) {
+    return {
+      sampleCount: 0,
+      horizonMinutes: 0,
+      modeSwitches: 0,
+      policySwitches: 0,
+      riskScoreDelta: 0,
+      highRiskRateDelta: 0,
+      decomposePolicyRateDelta: 0,
+      currentDominantMode: '',
+      currentDominantPolicy: '',
+      driftLevel: 'stable',
+    }
+  }
+
+  const first = points[0] as StrategyTrendPoint
+  const last = points[points.length - 1] as StrategyTrendPoint
+  let modeSwitches = 0
+  let policySwitches = 0
+  for (let index = 1; index < points.length; index += 1) {
+    const prev = points[index - 1] as StrategyTrendPoint
+    const current = points[index] as StrategyTrendPoint
+    if (prev.dominantMode && current.dominantMode && prev.dominantMode !== current.dominantMode) {
+      modeSwitches += 1
+    }
+    if (prev.dominantPolicy && current.dominantPolicy && prev.dominantPolicy !== current.dominantPolicy) {
+      policySwitches += 1
+    }
+  }
+
+  const riskScoreDelta = round2(last.riskScoreAvg - first.riskScoreAvg)
+  const highRiskRateDelta = round2(last.highRiskRate - first.highRiskRate)
+  const decomposePolicyRateDelta = round2(last.decomposePolicyRate - first.decomposePolicyRate)
+  const horizonMinutes = round2(Math.max(0, (last.capturedAtMs - first.capturedAtMs) / 60000))
+
+  let driftLevel: 'stable' | 'warning' | 'critical' = 'stable'
+  const critical =
+    riskScoreDelta >= 1.5
+    || highRiskRateDelta >= 0.15
+    || decomposePolicyRateDelta >= 0.2
+    || policySwitches >= 3
+    || modeSwitches >= 4
+  const warning =
+    riskScoreDelta >= 0.7
+    || highRiskRateDelta >= 0.08
+    || decomposePolicyRateDelta >= 0.1
+    || policySwitches >= 2
+    || modeSwitches >= 2
+  if (critical) {
+    driftLevel = 'critical'
+  } else if (warning) {
+    driftLevel = 'warning'
+  }
+
+  return {
+    sampleCount: points.length,
+    horizonMinutes,
+    modeSwitches,
+    policySwitches,
+    riskScoreDelta,
+    highRiskRateDelta,
+    decomposePolicyRateDelta,
+    currentDominantMode: last.dominantMode,
+    currentDominantPolicy: last.dominantPolicy,
+    driftLevel,
+  }
 }

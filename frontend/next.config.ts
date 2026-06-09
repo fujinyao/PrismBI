@@ -1,7 +1,7 @@
 import type { NextConfig } from "next";
 
-const apiInternalUrl = process.env.API_INTERNAL_URL || process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-const wsInternalUrl = process.env.WS_INTERNAL_URL || process.env.NEXT_PUBLIC_WS_URL || "http://localhost:8000";
+const apiInternalUrl = process.env.API_INTERNAL_URL || process.env.NEXT_PUBLIC_API_URL || "http://localhost:8400";
+const wsInternalUrl = process.env.WS_INTERNAL_URL || process.env.NEXT_PUBLIC_WS_URL || "http://localhost:8400";
 
 const withBundleAnalyzer = process.env.ANALYZE === "1"
   ? require("@next/bundle-analyzer")({ enabled: true })

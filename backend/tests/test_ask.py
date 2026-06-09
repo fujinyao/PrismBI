@@ -7,6 +7,15 @@ from fastapi.testclient import TestClient
 
 
 class TestAsk:
+    def test_ask_sse_chunk_text_uses_windowed_chunk_sizes(self):
+        from routers import ask as ask_router
+
+        chunks = ask_router._chunk_text("b" * 150, min_chars=48, max_chars=80)
+
+        assert len(chunks) == 2
+        assert len(chunks[0]) == 80
+        assert len(chunks[1]) == 70
+
     def test_ask_question_without_active_project_requires_temporary(self, test_app: TestClient, auth_headers: dict):
         response = test_app.post(
             "/api/ask",

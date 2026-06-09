@@ -358,7 +358,7 @@ DEFAULT_ENDPOINTS = {
     "openai": "https://api.openai.com/v1",
     "anthropic": "https://api.anthropic.com",
     "github_copilot": "https://api.githubcopilot.com",
-    "opencode_zen": "https://zen.opencode.ai/v1",
+    "opencode_zen": "https://opencode.ai/zen/v1",
     "maxkb": "http://localhost:8080/v1",
     "ollama": "http://localhost:11434/v1",
     "vllm": "http://localhost:8000/v1",

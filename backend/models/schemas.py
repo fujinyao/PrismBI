@@ -1118,6 +1118,10 @@ class RouterSettingsUpdate(BaseModel):
     tier1_max_retries: Optional[int] = Field(default=None, ge=1, le=10)
     tier2_max_retries: Optional[int] = Field(default=None, ge=1, le=10)
     tier3_max_retries: Optional[int] = Field(default=None, ge=1, le=10)
+    adaptive_strategy_enabled: Optional[bool] = None
+    adaptive_strategy_consensus_risk_threshold: Optional[int] = Field(default=None, ge=1, le=20)
+    adaptive_strategy_decompose_risk_threshold: Optional[int] = Field(default=None, ge=1, le=20)
+    adaptive_strategy_min_subquestions_for_decompose: Optional[int] = Field(default=None, ge=1, le=10)
     tier1_max_columns_per_model: Optional[int] = Field(default=None, ge=1, le=500)
     tier2_max_columns_per_model: Optional[int] = Field(default=None, ge=1, le=500)
     tier3_max_columns_per_model: Optional[int] = Field(default=None, ge=1, le=500)
@@ -1127,6 +1131,7 @@ class RouterSettingsUpdate(BaseModel):
     guidance_llm_available: Optional[bool] = None
     schema_pruning_enabled: Optional[bool] = None
     cross_source_max_workers: Optional[int] = Field(default=None, ge=1, le=32)
+    decompose_merge_enabled: Optional[bool] = None
     decompose_merge_circuit_enabled: Optional[bool] = None
     decompose_merge_failure_threshold: Optional[int] = Field(default=None, ge=1, le=20)
     decompose_merge_disable_seconds: Optional[float] = Field(default=None, ge=30.0, le=86400.0)
@@ -1141,6 +1146,9 @@ class RouterSettingsUpdate(BaseModel):
     route_observability_persist_enabled: Optional[bool] = None
     route_observability_persist_interval_seconds: Optional[float] = Field(default=None, ge=1.0, le=3600.0)
     route_observability_persist_event_delta: Optional[int] = Field(default=None, ge=1, le=10000)
+    route_observability_strategy_trend_max_points: Optional[int] = Field(default=None, ge=6, le=240)
+    route_observability_strategy_trend_persist_interval_seconds: Optional[float] = Field(default=None, ge=1.0, le=3600.0)
+    route_observability_strategy_trend_persist_decision_delta: Optional[int] = Field(default=None, ge=1, le=10000)
     sql_route_v2_enabled: Optional[bool] = None
     sql_route_allowlist_projects: Optional[List[int]] = None
     sql_route_shadow_mode: Optional[bool] = None

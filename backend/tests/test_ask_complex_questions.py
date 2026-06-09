@@ -515,6 +515,83 @@ def test_generate_sql_compound_decompose_merge_accepts_plain_text_merge_sql(monk
     assert result["sql_engine"] in {"decompose_merge", "decompose_merge_rehint"}
 
 
+def test_generate_sql_compound_decompose_merge_retries_merge_candidate_after_placeholder_sql(monkeypatch):
+    _patch_prompt_helpers(monkeypatch)
+    ask_service._decompose_merge_state_by_project.clear()
+    monkeypatch.setitem(ask_service.ROUTER_CONFIG, "tier3_max_retries", 3)
+
+    sub_sql_1 = (
+        "SELECT t.product_category_name_english, SUM(oi.price) AS total_sales "
+        "FROM olist_order_items_dataset oi "
+        "JOIN olist_products_dataset p ON oi.product_id = p.product_id "
+        "JOIN product_category_name_translation t ON p.product_category_name = t.product_category_name "
+        "GROUP BY t.product_category_name_english"
+    )
+    sub_sql_2 = (
+        "SELECT s.seller_city, COUNT(DISTINCT oi.order_id) AS order_cnt "
+        "FROM olist_order_items_dataset oi "
+        "JOIN olist_sellers_dataset s ON oi.seller_id = s.seller_id "
+        "GROUP BY s.seller_city"
+    )
+    placeholder_merge_sql = "SELECT * FROM [schema].[table]"
+    merged_sql = (
+        "SELECT t.product_category_name_english, s.seller_city, "
+        "SUM(oi.price) AS total_sales, COUNT(DISTINCT oi.order_id) AS order_cnt "
+        "FROM olist_order_items_dataset oi "
+        "JOIN olist_products_dataset p ON oi.product_id = p.product_id "
+        "JOIN product_category_name_translation t ON p.product_category_name = t.product_category_name "
+        "JOIN olist_sellers_dataset s ON oi.seller_id = s.seller_id "
+        "GROUP BY t.product_category_name_english, s.seller_city"
+    )
+
+    class FakeLLM:
+        def __init__(self):
+            self.sub_count = 0
+            self.merge_count = 0
+
+        def is_configured(self):
+            return True
+
+        def chat(self, messages, response_format="json"):
+            user_text = "\n".join(m.get("content", "") for m in messages if m.get("role") == "user")
+            if "Sub-question:" in user_text:
+                self.sub_count += 1
+                sql = sub_sql_1 if self.sub_count == 1 else sub_sql_2
+                return {"content": json.dumps({"sql": sql, "summary": "sub", "reasoning": "sub"})}
+            if "Combine these into a single SQL query" in user_text:
+                self.merge_count += 1
+                sql = placeholder_merge_sql if self.merge_count == 1 else merged_sql
+                return {"content": json.dumps({"sql": sql, "summary": "merged", "reasoning": "merged"})}
+            return {"content": json.dumps({"sql": merged_sql, "summary": "direct", "reasoning": "direct"})}
+
+    monkeypatch.setattr(ask_service, "LLMService", FakeLLM)
+
+    result = ask_service._generate_sql(
+        question="先看产品类目销售额，再看城市订单量，并合并成一个结果",
+        project_id=1,
+        semantic_context="ctx",
+        retrieved_tables=[
+            "olist_order_items_dataset",
+            "olist_products_dataset",
+            "product_category_name_translation",
+            "olist_sellers_dataset",
+        ],
+        semantic_hits=_olist_hits(),
+        analysis={
+            "tier": "compound",
+            "dimensions": ["Product", "City"],
+            "metrics": ["Sales", "Order Count"],
+            "entities": [],
+            "sub_questions": ["每个产品类目的销售额", "每个城市的订单量"],
+        },
+        language="zh",
+    )
+
+    assert result["sql"] == merged_sql
+    assert result["sql_engine"] in {"decompose_merge", "decompose_merge_rehint"}
+    ask_service._decompose_merge_state_by_project.clear()
+
+
 def test_generate_sql_compound_decompose_merge_circuit_breaker_skips_unstable_merge(monkeypatch):
     _patch_prompt_helpers(monkeypatch)
     ask_service._decompose_merge_state_by_project.clear()

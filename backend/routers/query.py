@@ -14,6 +14,7 @@ from services.ask_service import (
     execute_project_sql,
     get_execution_metrics_snapshot,
     get_route_dimension_metrics_snapshot,
+    get_route_strategy_trend_history,
 )
 from services.llm_service import get_llm_http_circuit_snapshot
 from services.security_policy_service import plan_secured_sql
@@ -35,9 +36,14 @@ def execution_metrics(
         raise HTTPException(status_code=403, detail="Permission denied")
     data = get_execution_metrics_snapshot(project_id=project_id)
     if include_route_dimensions:
+        route_dimensions = get_route_dimension_metrics_snapshot(project_id=project_id)
         data = {
             "by_datasource": data,
-            "route_dimensions": get_route_dimension_metrics_snapshot(project_id=project_id),
+            "route_dimensions": route_dimensions,
+            "strategy_trend_history": get_route_strategy_trend_history(
+                project_id=project_id,
+                route_dimensions=route_dimensions,
+            ),
             "llm_http_circuit": get_llm_http_circuit_snapshot(),
         }
     return {"data": data}

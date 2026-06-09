@@ -187,6 +187,13 @@ export interface QueryRouteDimensions {
   events_total: number
   route_kind: Record<string, number>
   generation_engine: Record<string, number>
+  strategy_selected_engine: Record<string, number>
+  strategy_mode: Record<string, number>
+  strategy_policy: Record<string, number>
+  strategy_risk_level: Record<string, number>
+  strategy_risk_score_total: number
+  strategy_risk_score_avg: number
+  strategy_risk_score_max: number
   strict_json_mode: Record<string, number>
   generation_decision_total: number
   fallback_count_total: number
@@ -212,6 +219,16 @@ export interface QueryRouteDimensions {
   last_updated: number
 }
 
+export interface QueryStrategyTrendPoint {
+  captured_at_unix: number
+  decision_total: number
+  risk_score_avg: number
+  high_risk_rate: number
+  decompose_policy_rate: number
+  dominant_mode: string
+  dominant_policy: string
+}
+
 export interface QueryLLMHttpCircuitKeyState {
   state: string
   remaining_open_seconds: number
@@ -227,6 +244,7 @@ export interface QueryLLMHttpCircuitSnapshot {
 export interface QueryExecutionMetricsWithRouteDimensions {
   by_datasource: QueryExecutionMetrics
   route_dimensions: QueryRouteDimensions
+  strategy_trend_history?: QueryStrategyTrendPoint[]
   llm_http_circuit?: QueryLLMHttpCircuitSnapshot
 }
 
@@ -238,11 +256,18 @@ export interface RouterRuntimeSnapshot {
   max_source_materialization_rows?: number
   analysis_cache_max?: number
   analysis_cache_ttl_s?: number
+  adaptive_strategy_enabled?: boolean
+  adaptive_strategy_consensus_risk_threshold?: number
+  adaptive_strategy_decompose_risk_threshold?: number
+  adaptive_strategy_min_subquestions_for_decompose?: number
   route_observability_window_seconds?: number
   route_observability_max_events_per_project?: number
   route_observability_persist_enabled?: boolean
   route_observability_persist_interval_seconds?: number
   route_observability_persist_event_delta?: number
+  route_observability_strategy_trend_max_points?: number
+  route_observability_strategy_trend_persist_interval_seconds?: number
+  route_observability_strategy_trend_persist_decision_delta?: number
   sql_route_v2_enabled?: boolean
   sql_route_shadow_mode?: boolean
   sql_route_profile_id?: string

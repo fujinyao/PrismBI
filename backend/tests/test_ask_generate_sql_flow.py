@@ -2057,6 +2057,16 @@ def test_ask_question_route_events_include_clause_summary(monkeypatch):
     assert terminal_event["non_metadata_clause_count"] == 1
     assert terminal_event["clause_routing"]["clauses"][0]["route"] == "sql"
     assert terminal_event["repair_path"] == "none"
+    assert terminal_event["attempt_count"] == 0
+    assert terminal_event["fallback_chain"] == []
+    assert set(terminal_event["stage_durations_ms"].keys()) == {
+        "understand",
+        "retrieve",
+        "generate",
+        "execute",
+        "answer",
+    }
+    assert float(terminal_event["stage_durations_ms"]["generate"]) >= 0.0
     assert float(terminal_event["duration_ms"]) >= 0.0
 
 
@@ -2183,6 +2193,15 @@ def test_ask_question_terminal_event_marks_generation_rehint_path(monkeypatch):
     assert result["summary"] == "final"
     terminal_event = next(payload for event, payload, _pid in events if event == "ask_route_success")
     assert terminal_event["repair_path"] == "generation_rehint"
+    assert terminal_event["attempt_count"] == 1
+    assert "generation_rehint" in terminal_event["fallback_chain"]
+    assert set(terminal_event["stage_durations_ms"].keys()) == {
+        "understand",
+        "retrieve",
+        "generate",
+        "execute",
+        "answer",
+    }
     assert float(terminal_event["duration_ms"]) >= 0.0
 
 

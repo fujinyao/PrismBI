@@ -416,6 +416,11 @@ class TestExecuteQuery:
             "generation_route_decision",
             {
                 "generation_engine": "direct_llm",
+                "strategy_selected_engine": "fewshot_cot",
+                "strategy_mode": "adaptive_risk",
+                "strategy_policy": "risk_consensus_fewshot",
+                "strategy_risk_score": 6,
+                "strategy_risk_level": "medium",
                 "strict_json_mode": "json_schema",
                 "fallback_count": 1,
                 "fallback_chain": ["repair"],
@@ -500,6 +505,12 @@ class TestExecuteQuery:
         data = response.json()["data"]
         assert data["by_datasource"]["postgresql"]["total"] == 1
         assert data["route_dimensions"]["generation_engine"]["direct_llm"] >= 1
+        assert data["route_dimensions"]["strategy_selected_engine"]["fewshot_cot"] >= 1
+        assert data["route_dimensions"]["strategy_mode"]["adaptive_risk"] >= 1
+        assert data["route_dimensions"]["strategy_policy"]["risk_consensus_fewshot"] >= 1
+        assert data["route_dimensions"]["strategy_risk_level"]["medium"] >= 1
+        assert data["route_dimensions"]["strategy_risk_score_total"] >= 6
+        assert data["route_dimensions"]["strategy_risk_score_avg"] >= 0.0
         assert data["route_dimensions"]["route_kind"]["single_external"] >= 1
         assert data["route_dimensions"]["strict_json_mode"]["json_schema"] >= 1
         assert data["route_dimensions"]["generation_retry_reason"]["empty_llm_content"] >= 1
@@ -519,6 +530,69 @@ class TestExecuteQuery:
         assert data["route_dimensions"]["sql_generation_fallback_rate"] >= 0.0
         assert data["route_dimensions"]["final_answer_fallback_rate"] >= 0.0
         assert data["route_dimensions"]["window_seconds"] == ask_service.ROUTER_CONFIG["route_observability_window_seconds"]
+        assert isinstance(data["strategy_trend_history"], list)
+        assert len(data["strategy_trend_history"]) >= 1
+        latest_trend = data["strategy_trend_history"][-1]
+        assert latest_trend["decision_total"] >= 1
+        assert latest_trend["dominant_mode"] == "adaptive_risk"
+        assert latest_trend["dominant_policy"] == "risk_consensus_fewshot"
+
+    def test_strategy_trend_history_recovers_from_persisted_snapshot(
+        self,
+        test_app: TestClient,
+        auth_headers: dict,
+        test_db,
+        monkeypatch,
+    ):
+        import services.ask_service as ask_service
+
+        ask_service.clear_execution_metrics()
+        monkeypatch.setitem(ask_service.ROUTER_CONFIG, "route_observability_window_seconds", 1800)
+        monkeypatch.setitem(ask_service.ROUTER_CONFIG, "route_observability_persist_enabled", True)
+        monkeypatch.setitem(ask_service.ROUTER_CONFIG, "route_observability_persist_interval_seconds", 1)
+        monkeypatch.setitem(ask_service.ROUTER_CONFIG, "route_observability_persist_event_delta", 1)
+
+        clock = {"mono": 1000.0, "wall": 100000.0}
+        monkeypatch.setattr(ask_service.time, "monotonic", lambda: clock["mono"])
+        monkeypatch.setattr(ask_service.time, "time", lambda: clock["wall"])
+
+        ask_service._emit_route_event(
+            "generation_route_decision",
+            {
+                "generation_engine": "direct_llm",
+                "strategy_selected_engine": "fewshot_cot",
+                "strategy_mode": "adaptive_risk",
+                "strategy_policy": "risk_consensus_fewshot",
+                "strategy_risk_score": 5,
+                "strategy_risk_level": "medium",
+                "strict_json_mode": "json_schema",
+                "fallback_count": 0,
+            },
+            project_id=1,
+        )
+
+        trend_key = ask_service._route_observability_strategy_trend_setting_key(1)
+        persisted = test_db.execute("SELECT value FROM metadata.settings WHERE key = ?", [trend_key]).fetchone()
+        assert persisted is not None
+
+        with ask_service._route_dimension_metrics_lock:
+            ask_service._route_dimension_metrics_by_project.clear()
+            ask_service._route_dimension_events_by_project.clear()
+            ask_service._route_observability_snapshot_state_by_project.clear()
+            ask_service._route_strategy_trend_points_by_project.clear()
+
+        restored = test_app.get(
+            "/api/query/metrics?project_id=1&include_route_dimensions=true",
+            headers=auth_headers,
+        )
+        assert restored.status_code == 200
+        restored_data = restored.json()["data"]
+        history = restored_data["strategy_trend_history"]
+        assert len(history) >= 1
+        latest = history[-1]
+        assert latest["decision_total"] >= 1
+        assert latest["dominant_mode"] == "adaptive_risk"
+        assert latest["dominant_policy"] == "risk_consensus_fewshot"
 
     def test_route_dimensions_respect_observability_window(self, test_app: TestClient, auth_headers: dict, monkeypatch):
         import services.ask_service as ask_service
@@ -748,6 +822,57 @@ class TestExecuteQuery:
         assert len(persist_calls) == 3
         assert persist_calls[-1][1] == 6
 
+    def test_strategy_trend_persist_uses_dedicated_thresholds(self, test_db, monkeypatch):
+        import services.ask_service as ask_service
+
+        ask_service.clear_execution_metrics()
+        monkeypatch.setitem(ask_service.ROUTER_CONFIG, "route_observability_window_seconds", 1800)
+        monkeypatch.setitem(ask_service.ROUTER_CONFIG, "route_observability_persist_enabled", True)
+        monkeypatch.setitem(ask_service.ROUTER_CONFIG, "route_observability_persist_interval_seconds", 3600)
+        monkeypatch.setitem(ask_service.ROUTER_CONFIG, "route_observability_persist_event_delta", 9999)
+        monkeypatch.setitem(ask_service.ROUTER_CONFIG, "route_observability_strategy_trend_max_points", 8)
+        monkeypatch.setitem(ask_service.ROUTER_CONFIG, "route_observability_strategy_trend_persist_interval_seconds", 1)
+        monkeypatch.setitem(ask_service.ROUTER_CONFIG, "route_observability_strategy_trend_persist_decision_delta", 1)
+
+        clock = {"mono": 1000.0, "wall": 100000.0}
+        monkeypatch.setattr(ask_service.time, "monotonic", lambda: clock["mono"])
+        monkeypatch.setattr(ask_service.time, "time", lambda: clock["wall"])
+
+        ask_service._emit_route_event(
+            "generation_route_decision",
+            {
+                "generation_engine": "direct_llm",
+                "strategy_selected_engine": "fewshot_cot",
+                "strategy_mode": "adaptive_risk",
+                "strategy_policy": "risk_consensus_fewshot",
+                "strategy_risk_score": 6,
+                "strategy_risk_level": "medium",
+                "strict_json_mode": "json_schema",
+                "fallback_count": 0,
+            },
+            project_id=1,
+        )
+
+        snapshot_key = ask_service._route_observability_snapshot_setting_key(1)
+        trend_key = ask_service._route_observability_strategy_trend_setting_key(1)
+        snapshot_row = test_db.execute("SELECT value FROM metadata.settings WHERE key = ?", [snapshot_key]).fetchone()
+        trend_row = test_db.execute("SELECT value FROM metadata.settings WHERE key = ?", [trend_key]).fetchone()
+
+        assert snapshot_row is None
+        assert trend_row is not None
+
+        trend_payload = trend_row[0]
+        if isinstance(trend_payload, str):
+            trend_payload = json.loads(trend_payload)
+        assert isinstance(trend_payload, dict)
+        points = trend_payload.get("points")
+        assert isinstance(points, list)
+        assert len(points) == 1
+        point = points[0]
+        assert int(point.get("decision_total") or 0) >= 1
+        assert point.get("dominant_mode") == "adaptive_risk"
+        assert point.get("dominant_policy") == "risk_consensus_fewshot"
+
     def test_clear_route_dimension_metrics_deletes_persisted_snapshot(self, test_db, monkeypatch):
         import services.ask_service as ask_service
 
@@ -771,15 +896,34 @@ class TestExecuteQuery:
             },
             project_id=1,
         )
+        ask_service._emit_route_event(
+            "generation_route_decision",
+            {
+                "generation_engine": "direct_llm",
+                "strategy_selected_engine": "direct_llm",
+                "strategy_mode": "adaptive_risk",
+                "strategy_policy": "risk_constrained_direct",
+                "strategy_risk_score": 2,
+                "strategy_risk_level": "low",
+                "strict_json_mode": "none",
+                "fallback_count": 0,
+            },
+            project_id=1,
+        )
 
         snapshot_key = ask_service._route_observability_snapshot_setting_key(1)
+        trend_key = ask_service._route_observability_strategy_trend_setting_key(1)
         before_clear = test_db.execute("SELECT value FROM metadata.settings WHERE key = ?", [snapshot_key]).fetchone()
+        before_trend_clear = test_db.execute("SELECT value FROM metadata.settings WHERE key = ?", [trend_key]).fetchone()
         assert before_clear is not None
+        assert before_trend_clear is not None
 
         ask_service.clear_route_dimension_metrics(project_id=1)
 
         after_clear = test_db.execute("SELECT value FROM metadata.settings WHERE key = ?", [snapshot_key]).fetchone()
+        after_trend_clear = test_db.execute("SELECT value FROM metadata.settings WHERE key = ?", [trend_key]).fetchone()
         assert after_clear is None
+        assert after_trend_clear is None
 
     def test_route_dimensions_handles_corrupted_persisted_snapshot(self, test_app: TestClient, auth_headers: dict, test_db, monkeypatch):
         import services.ask_service as ask_service

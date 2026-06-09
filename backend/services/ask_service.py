@@ -65,6 +65,10 @@ ROUTER_CONFIG = {
     "tier1_max_retries": 1,
     "tier2_max_retries": 2,
     "tier3_max_retries": 3,
+    "adaptive_strategy_enabled": True,
+    "adaptive_strategy_consensus_risk_threshold": 4,
+    "adaptive_strategy_decompose_risk_threshold": 7,
+    "adaptive_strategy_min_subquestions_for_decompose": 2,
     "tier1_max_columns_per_model": 12,
     "tier2_max_columns_per_model": 15,
     "tier3_max_columns_per_model": 20,
@@ -74,9 +78,10 @@ ROUTER_CONFIG = {
     "guidance_llm_available": True,
     "schema_pruning_enabled": True,
     "cross_source_max_workers": 4,
+    "decompose_merge_enabled": True,
     "decompose_merge_circuit_enabled": True,
-    "decompose_merge_failure_threshold": 2,
-    "decompose_merge_disable_seconds": 300,
+    "decompose_merge_failure_threshold": 1,
+    "decompose_merge_disable_seconds": 3600,
     "external_connection_pool_enabled": True,
     "external_connection_pool_max_per_key": 4,
     "external_connection_pool_idle_seconds": 300,
@@ -88,6 +93,9 @@ ROUTER_CONFIG = {
     "route_observability_persist_enabled": True,
     "route_observability_persist_interval_seconds": 30,
     "route_observability_persist_event_delta": 20,
+    "route_observability_strategy_trend_max_points": 24,
+    "route_observability_strategy_trend_persist_interval_seconds": 60,
+    "route_observability_strategy_trend_persist_decision_delta": 5,
     "sql_route_v2_enabled": True,
     "sql_route_allowlist_projects": [],
     "sql_route_shadow_mode": False,
@@ -255,9 +263,13 @@ _DATA_ROUTE_INDICATORS = (
     "产品", "类别", "客户", "月", "年", "季度", "最好", "最差", "最高", "最低",
     "销售量", "销售额", "订单量", "收入", "利润", "数量",
 )
+_DECOMPOSE_SQL_PLACEHOLDER_RE = re.compile(
+    r"(?:\[(?:schema|table|column|database)\]|<(?:schema|table|column|database)>|\byour_(?:schema|table|column)\b|\bexample_(?:schema|table|column)\b)",
+    re.IGNORECASE,
+)
 
 _PROMPT_PROFILE_ROUTER = PromptProfileRouter()
-_GENERATION_ROUTER = GenerationRouter()
+_GENERATION_ROUTER = GenerationRouter(config_getter=lambda: ROUTER_CONFIG)
 _EXECUTION_ROUTER = ExecutionRouter()
 
 
@@ -330,6 +342,13 @@ def _looks_like_response_format_error(exc: Exception) -> bool:
         "schema",
     )
     return any(marker in lowered for marker in markers)
+
+
+def _contains_sql_placeholder_markers(sql: str) -> bool:
+    text = str(sql or "")
+    if not text:
+        return False
+    return bool(_DECOMPOSE_SQL_PLACEHOLDER_RE.search(text))
 
 
 def _llm_chat_with_response_format_fallback(
@@ -484,6 +503,83 @@ def _normalize_sql_candidate(value: Any) -> str:
     if sql.endswith(";"):
         sql = sql[:-1].strip()
     return sql
+
+
+def _rewrite_bracket_identifiers_for_duckdb(sql: str) -> str:
+    text = str(sql or "")
+    if "[" not in text or "]" not in text:
+        return text
+    normalized: list[str] = []
+    in_single = False
+    in_double = False
+    in_backtick = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if in_single:
+            normalized.append(ch)
+            if ch == "'":
+                if i + 1 < len(text) and text[i + 1] == "'":
+                    normalized.append(text[i + 1])
+                    i += 2
+                    continue
+                in_single = False
+            i += 1
+            continue
+        if in_double:
+            normalized.append(ch)
+            if ch == '"':
+                if i + 1 < len(text) and text[i + 1] == '"':
+                    normalized.append(text[i + 1])
+                    i += 2
+                    continue
+                in_double = False
+            i += 1
+            continue
+        if in_backtick:
+            normalized.append(ch)
+            if ch == "`":
+                if i + 1 < len(text) and text[i + 1] == "`":
+                    normalized.append(text[i + 1])
+                    i += 2
+                    continue
+                in_backtick = False
+            i += 1
+            continue
+
+        if ch == "'":
+            in_single = True
+            normalized.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            normalized.append(ch)
+            i += 1
+            continue
+        if ch == "`":
+            in_backtick = True
+            normalized.append(ch)
+            i += 1
+            continue
+        if ch == "[":
+            end = i + 1
+            while end < len(text) and text[end] != "]":
+                end += 1
+            if end < len(text):
+                token = text[i + 1 : end]
+                if token.strip():
+                    escaped_token = token.replace('"', '""')
+                    normalized.append(f'"{escaped_token}"')
+                    i = end + 1
+                    continue
+            normalized.append(ch)
+            i += 1
+            continue
+
+        normalized.append(ch)
+        i += 1
+    return "".join(normalized)
 
 
 def _sanitize_error_message(value: Any, max_length: int = 320) -> str:
@@ -1113,6 +1209,21 @@ def refresh_runtime_router_settings(force: bool = False) -> dict[str, Any]:
         "router_tier1_max_retries": (updated_router.get("tier1_max_retries", 1), 1, 10),
         "router_tier2_max_retries": (updated_router.get("tier2_max_retries", 2), 1, 10),
         "router_tier3_max_retries": (updated_router.get("tier3_max_retries", 3), 1, 10),
+        "router_adaptive_strategy_consensus_risk_threshold": (
+            updated_router.get("adaptive_strategy_consensus_risk_threshold", 4),
+            1,
+            20,
+        ),
+        "router_adaptive_strategy_decompose_risk_threshold": (
+            updated_router.get("adaptive_strategy_decompose_risk_threshold", 7),
+            1,
+            20,
+        ),
+        "router_adaptive_strategy_min_subquestions_for_decompose": (
+            updated_router.get("adaptive_strategy_min_subquestions_for_decompose", 2),
+            1,
+            10,
+        ),
         "router_tier1_max_columns_per_model": (updated_router.get("tier1_max_columns_per_model", 12), 1, 500),
         "router_tier2_max_columns_per_model": (updated_router.get("tier2_max_columns_per_model", 15), 1, 500),
         "router_tier3_max_columns_per_model": (updated_router.get("tier3_max_columns_per_model", 20), 1, 500),
@@ -1120,7 +1231,7 @@ def refresh_runtime_router_settings(force: bool = False) -> dict[str, Any]:
         "router_max_suggested_questions": (updated_router.get("max_suggested_questions", 5), 1, 20),
         "router_metadata_summary_max_models": (updated_router.get("metadata_summary_max_models", 10), 1, 200),
         "router_cross_source_max_workers": (updated_router.get("cross_source_max_workers", 4), 1, 32),
-        "router_decompose_merge_failure_threshold": (updated_router.get("decompose_merge_failure_threshold", 2), 1, 20),
+        "router_decompose_merge_failure_threshold": (updated_router.get("decompose_merge_failure_threshold", 1), 1, 20),
         "router_external_connection_pool_max_per_key": (updated_router.get("external_connection_pool_max_per_key", 4), 1, 64),
         "router_execution_metrics_log_every": (updated_router.get("execution_metrics_log_every", 25), 1, 2000),
         "router_execution_metrics_max_samples": (updated_router.get("execution_metrics_max_samples", 400), 50, 10000),
@@ -1135,9 +1246,19 @@ def refresh_runtime_router_settings(force: bool = False) -> dict[str, Any]:
             1,
             10000,
         ),
+        "router_route_observability_strategy_trend_max_points": (
+            updated_router.get("route_observability_strategy_trend_max_points", 24),
+            6,
+            240,
+        ),
+        "router_route_observability_strategy_trend_persist_decision_delta": (
+            updated_router.get("route_observability_strategy_trend_persist_decision_delta", 5),
+            1,
+            10000,
+        ),
     }
     float_router_settings: dict[str, tuple[float, float, float]] = {
-        "router_decompose_merge_disable_seconds": (updated_router.get("decompose_merge_disable_seconds", 300), 30.0, 86400.0),
+        "router_decompose_merge_disable_seconds": (updated_router.get("decompose_merge_disable_seconds", 3600), 30.0, 86400.0),
         "router_external_connection_pool_idle_seconds": (updated_router.get("external_connection_pool_idle_seconds", 300), 30.0, 86400.0),
         "router_execution_metrics_log_interval_seconds": (updated_router.get("execution_metrics_log_interval_seconds", 180), 10.0, 86400.0),
         "router_route_observability_persist_interval_seconds": (
@@ -1145,10 +1266,17 @@ def refresh_runtime_router_settings(force: bool = False) -> dict[str, Any]:
             1.0,
             3600.0,
         ),
+        "router_route_observability_strategy_trend_persist_interval_seconds": (
+            updated_router.get("route_observability_strategy_trend_persist_interval_seconds", 60),
+            1.0,
+            3600.0,
+        ),
     }
     bool_router_settings: dict[str, str] = {
+        "router_adaptive_strategy_enabled": "adaptive_strategy_enabled",
         "router_guidance_llm_available": "guidance_llm_available",
         "router_schema_pruning_enabled": "schema_pruning_enabled",
+        "router_decompose_merge_enabled": "decompose_merge_enabled",
         "router_decompose_merge_circuit_enabled": "decompose_merge_circuit_enabled",
         "router_external_connection_pool_enabled": "external_connection_pool_enabled",
         "router_route_observability_persist_enabled": "route_observability_persist_enabled",
@@ -1163,6 +1291,9 @@ def refresh_runtime_router_settings(force: bool = False) -> dict[str, Any]:
         "router_tier1_max_retries": "tier1_max_retries",
         "router_tier2_max_retries": "tier2_max_retries",
         "router_tier3_max_retries": "tier3_max_retries",
+        "router_adaptive_strategy_consensus_risk_threshold": "adaptive_strategy_consensus_risk_threshold",
+        "router_adaptive_strategy_decompose_risk_threshold": "adaptive_strategy_decompose_risk_threshold",
+        "router_adaptive_strategy_min_subquestions_for_decompose": "adaptive_strategy_min_subquestions_for_decompose",
         "router_tier1_max_columns_per_model": "tier1_max_columns_per_model",
         "router_tier2_max_columns_per_model": "tier2_max_columns_per_model",
         "router_tier3_max_columns_per_model": "tier3_max_columns_per_model",
@@ -1177,12 +1308,15 @@ def refresh_runtime_router_settings(force: bool = False) -> dict[str, Any]:
         "router_route_observability_window_seconds": "route_observability_window_seconds",
         "router_route_observability_max_events_per_project": "route_observability_max_events_per_project",
         "router_route_observability_persist_event_delta": "route_observability_persist_event_delta",
+        "router_route_observability_strategy_trend_max_points": "route_observability_strategy_trend_max_points",
+        "router_route_observability_strategy_trend_persist_decision_delta": "route_observability_strategy_trend_persist_decision_delta",
     }
     float_router_mapping = {
         "router_decompose_merge_disable_seconds": "decompose_merge_disable_seconds",
         "router_external_connection_pool_idle_seconds": "external_connection_pool_idle_seconds",
         "router_execution_metrics_log_interval_seconds": "execution_metrics_log_interval_seconds",
         "router_route_observability_persist_interval_seconds": "route_observability_persist_interval_seconds",
+        "router_route_observability_strategy_trend_persist_interval_seconds": "route_observability_strategy_trend_persist_interval_seconds",
     }
 
     for setting_key, (default_value, minimum, maximum) in integer_router_settings.items():
@@ -1198,6 +1332,29 @@ def refresh_runtime_router_settings(force: bool = False) -> dict[str, Any]:
     for setting_key, config_key in bool_router_settings.items():
         if setting_key in settings:
             updated_router[config_key] = _normalize_bool(settings.get(setting_key))
+
+    adaptive_consensus_threshold = _coerce_int_setting(
+        updated_router.get("adaptive_strategy_consensus_risk_threshold"),
+        4,
+        1,
+        20,
+    )
+    adaptive_decompose_threshold = _coerce_int_setting(
+        updated_router.get("adaptive_strategy_decompose_risk_threshold"),
+        7,
+        1,
+        20,
+    )
+    if adaptive_decompose_threshold < adaptive_consensus_threshold:
+        adaptive_decompose_threshold = adaptive_consensus_threshold
+    updated_router["adaptive_strategy_consensus_risk_threshold"] = adaptive_consensus_threshold
+    updated_router["adaptive_strategy_decompose_risk_threshold"] = adaptive_decompose_threshold
+    updated_router["adaptive_strategy_min_subquestions_for_decompose"] = _coerce_int_setting(
+        updated_router.get("adaptive_strategy_min_subquestions_for_decompose"),
+        2,
+        1,
+        10,
+    )
 
     if "router_sql_route_allowlist_projects" in settings:
         updated_router["sql_route_allowlist_projects"] = _coerce_int_list_setting(settings.get("router_sql_route_allowlist_projects"))
@@ -1273,8 +1430,8 @@ def _is_decompose_merge_temporarily_disabled(project_id: int) -> bool:
 def _record_decompose_merge_failure(project_id: int, reason: str | None = None) -> None:
     if not ROUTER_CONFIG.get("decompose_merge_circuit_enabled", True):
         return
-    threshold = max(1, int(ROUTER_CONFIG.get("decompose_merge_failure_threshold", 2) or 2))
-    disable_seconds = max(30.0, float(ROUTER_CONFIG.get("decompose_merge_disable_seconds", 300) or 300))
+    threshold = max(1, int(ROUTER_CONFIG.get("decompose_merge_failure_threshold", 1) or 1))
+    disable_seconds = max(30.0, float(ROUTER_CONFIG.get("decompose_merge_disable_seconds", 3600) or 3600))
     now = time.monotonic()
     with _decompose_merge_state_lock:
         state = _decompose_merge_state_by_project.setdefault(int(project_id), {"failures": 0.0, "disabled_until": 0.0})
@@ -1477,8 +1634,13 @@ _route_dimension_metrics_lock = threading.Lock()
 _route_dimension_metrics_by_project: dict[int, dict[str, Any]] = {}
 _route_dimension_events_by_project: dict[int, deque[tuple[float, str, dict[str, Any]]]] = {}
 _route_observability_snapshot_state_by_project: dict[int, dict[str, float]] = {}
+_route_strategy_trend_points_by_project: dict[int, deque[dict[str, Any]]] = {}
+_route_strategy_trend_snapshot_state_by_project: dict[int, dict[str, float]] = {}
 _ROUTE_OBSERVABILITY_RETENTION_SECONDS = 86400.0
 _ROUTE_OBSERVABILITY_SNAPSHOT_KEY_PREFIX = "router_route_observability_snapshot_project_"
+_ROUTE_OBSERVABILITY_STRATEGY_TREND_KEY_PREFIX = "router_route_observability_strategy_trend_project_"
+_ROUTE_OBSERVABILITY_STRATEGY_TREND_DEFAULT_MAX_POINTS = 24
+_ROUTE_OBSERVABILITY_STRATEGY_TREND_MAX_POINTS = 240
 
 
 def _new_execution_metric_bucket() -> dict[str, Any]:
@@ -1524,6 +1686,12 @@ def _new_route_dimension_bucket() -> dict[str, Any]:
         "events_total": 0,
         "route_kind": {},
         "generation_engine": {},
+        "strategy_selected_engine": {},
+        "strategy_mode": {},
+        "strategy_policy": {},
+        "strategy_risk_level": {},
+        "strategy_risk_score_total": 0,
+        "strategy_risk_score_max": 0,
         "strict_json_mode": {},
         "generation_decision_total": 0,
         "fallback_count_total": 0,
@@ -1580,8 +1748,39 @@ def _route_observability_persist_event_delta() -> int:
     )
 
 
+def _route_observability_strategy_trend_max_points() -> int:
+    return _coerce_int_setting(
+        ROUTER_CONFIG.get("route_observability_strategy_trend_max_points"),
+        _ROUTE_OBSERVABILITY_STRATEGY_TREND_DEFAULT_MAX_POINTS,
+        6,
+        _ROUTE_OBSERVABILITY_STRATEGY_TREND_MAX_POINTS,
+    )
+
+
+def _route_observability_strategy_trend_persist_interval_seconds() -> float:
+    return _coerce_float_setting(
+        ROUTER_CONFIG.get("route_observability_strategy_trend_persist_interval_seconds"),
+        60.0,
+        1.0,
+        3600.0,
+    )
+
+
+def _route_observability_strategy_trend_persist_decision_delta() -> int:
+    return _coerce_int_setting(
+        ROUTER_CONFIG.get("route_observability_strategy_trend_persist_decision_delta"),
+        5,
+        1,
+        10000,
+    )
+
+
 def _route_observability_snapshot_setting_key(project_id: int) -> str:
     return f"{_ROUTE_OBSERVABILITY_SNAPSHOT_KEY_PREFIX}{int(project_id)}"
+
+
+def _route_observability_strategy_trend_setting_key(project_id: int) -> str:
+    return f"{_ROUTE_OBSERVABILITY_STRATEGY_TREND_KEY_PREFIX}{int(project_id)}"
 
 
 def _route_dimension_zero_snapshot(window_seconds: int) -> dict[str, Any]:
@@ -1589,6 +1788,13 @@ def _route_dimension_zero_snapshot(window_seconds: int) -> dict[str, Any]:
         "events_total": 0,
         "route_kind": {},
         "generation_engine": {},
+        "strategy_selected_engine": {},
+        "strategy_mode": {},
+        "strategy_policy": {},
+        "strategy_risk_level": {},
+        "strategy_risk_score_total": 0,
+        "strategy_risk_score_avg": 0.0,
+        "strategy_risk_score_max": 0,
         "strict_json_mode": {},
         "generation_decision_total": 0,
         "fallback_count_total": 0,
@@ -1621,10 +1827,18 @@ def _route_dimension_bucket_snapshot(bucket: dict[str, Any], window_seconds: int
     schema_link_fallback_total = int(bucket.get("schema_link_fallback_total") or 0)
     sql_generation_fallback_total = int(bucket.get("sql_generation_fallback_total") or 0)
     final_answer_fallback_total = int(bucket.get("final_answer_fallback_total") or 0)
+    strategy_risk_score_total = int(bucket.get("strategy_risk_score_total") or 0)
     return {
         "events_total": int(bucket.get("events_total") or 0),
         "route_kind": dict(bucket.get("route_kind") or {}),
         "generation_engine": dict(bucket.get("generation_engine") or {}),
+        "strategy_selected_engine": dict(bucket.get("strategy_selected_engine") or {}),
+        "strategy_mode": dict(bucket.get("strategy_mode") or {}),
+        "strategy_policy": dict(bucket.get("strategy_policy") or {}),
+        "strategy_risk_level": dict(bucket.get("strategy_risk_level") or {}),
+        "strategy_risk_score_total": strategy_risk_score_total,
+        "strategy_risk_score_avg": round(strategy_risk_score_total / generation_total, 2) if generation_total > 0 else 0.0,
+        "strategy_risk_score_max": int(bucket.get("strategy_risk_score_max") or 0),
         "strict_json_mode": dict(bucket.get("strict_json_mode") or {}),
         "generation_decision_total": int(bucket.get("generation_decision_total") or generation_total),
         "fallback_count_total": fallback_total,
@@ -1678,6 +1892,199 @@ def _coerce_counter_map(value: Any) -> dict[str, int]:
             continue
         normalized[str(key or "unknown")] = count
     return normalized
+
+
+def _counter_top_key(counter: dict[str, int]) -> str:
+    if not counter:
+        return ""
+    ranked = sorted(counter.items(), key=lambda item: (-int(item[1] or 0), str(item[0] or "")))
+    return str(ranked[0][0] or "") if ranked else ""
+
+
+def _ensure_strategy_trend_history(project_id: int, max_points: int) -> deque[dict[str, Any]]:
+    pid = int(project_id)
+    normalized_max_points = max(6, int(max_points))
+    existing = _route_strategy_trend_points_by_project.get(pid)
+    if existing is not None and existing.maxlen == normalized_max_points:
+        return existing
+    next_history = deque(existing or [], maxlen=normalized_max_points)
+    _route_strategy_trend_points_by_project[pid] = next_history
+    return next_history
+
+
+def _coerce_strategy_trend_point(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    captured_at_unix = _coerce_non_negative_float(value.get("captured_at_unix"), 0.0)
+    decision_total = _coerce_non_negative_int(value.get("decision_total"), 0)
+    if captured_at_unix <= 0 or decision_total <= 0:
+        return None
+    risk_score_avg = _coerce_non_negative_float(value.get("risk_score_avg"), 0.0)
+    high_risk_rate = min(1.0, _coerce_non_negative_float(value.get("high_risk_rate"), 0.0))
+    decompose_policy_rate = min(1.0, _coerce_non_negative_float(value.get("decompose_policy_rate"), 0.0))
+    dominant_mode = str(value.get("dominant_mode") or "").strip().lower()
+    dominant_policy = str(value.get("dominant_policy") or "").strip().lower()
+    return {
+        "captured_at_unix": round(captured_at_unix, 3),
+        "decision_total": decision_total,
+        "risk_score_avg": round(risk_score_avg, 3),
+        "high_risk_rate": round(high_risk_rate, 6),
+        "decompose_policy_rate": round(decompose_policy_rate, 6),
+        "dominant_mode": dominant_mode,
+        "dominant_policy": dominant_policy,
+    }
+
+
+def _normalize_strategy_trend_points(
+    value: Any,
+    *,
+    retention_seconds: float,
+    max_points: int,
+) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    retention = max(60.0, float(retention_seconds))
+    limit = max(6, int(max_points))
+    now_unix = time.time()
+    normalized: list[dict[str, Any]] = []
+    for item in value:
+        point = _coerce_strategy_trend_point(item)
+        if point is None:
+            continue
+        captured_at_unix = float(point.get("captured_at_unix") or 0.0)
+        if captured_at_unix <= 0:
+            continue
+        if (now_unix - captured_at_unix) > retention:
+            continue
+        normalized.append(point)
+    normalized.sort(key=lambda item: float(item.get("captured_at_unix") or 0.0))
+    if len(normalized) > limit:
+        normalized = normalized[-limit:]
+    return normalized
+
+
+def _append_strategy_trend_point(history: deque[dict[str, Any]], point: dict[str, Any], *, max_points: int) -> bool:
+    limit = max(6, int(max_points))
+    if not history:
+        history.append(dict(point))
+        return True
+    last = history[-1]
+    unchanged = (
+        int(last.get("decision_total") or 0) == int(point.get("decision_total") or 0)
+        and abs(float(last.get("risk_score_avg") or 0.0) - float(point.get("risk_score_avg") or 0.0)) < 0.001
+        and abs(float(last.get("high_risk_rate") or 0.0) - float(point.get("high_risk_rate") or 0.0)) < 0.0005
+        and abs(float(last.get("decompose_policy_rate") or 0.0) - float(point.get("decompose_policy_rate") or 0.0)) < 0.0005
+        and str(last.get("dominant_mode") or "") == str(point.get("dominant_mode") or "")
+        and str(last.get("dominant_policy") or "") == str(point.get("dominant_policy") or "")
+    )
+    if unchanged:
+        return False
+    history.append(dict(point))
+    while len(history) > limit:
+        history.popleft()
+    return True
+
+
+def _strategy_trend_point_from_snapshot(snapshot: dict[str, Any], captured_at_unix: float) -> dict[str, Any] | None:
+    generation_total = _coerce_non_negative_int(snapshot.get("generation_decision_total"), 0)
+    if generation_total <= 0:
+        generation_total = sum(int(item) for item in _coerce_counter_map(snapshot.get("generation_engine")).values())
+    if generation_total <= 0:
+        return None
+    strategy_modes = _coerce_counter_map(snapshot.get("strategy_mode"))
+    strategy_policies = _coerce_counter_map(snapshot.get("strategy_policy"))
+    strategy_risk_levels = _coerce_counter_map(snapshot.get("strategy_risk_level"))
+    high_risk_count = int(strategy_risk_levels.get("high") or 0)
+    decompose_policy_count = max(
+        int(strategy_policies.get("risk_decompose_merge") or 0),
+        int(strategy_policies.get("decompose_merge") or 0),
+    )
+    point = _coerce_strategy_trend_point(
+        {
+            "captured_at_unix": captured_at_unix,
+            "decision_total": generation_total,
+            "risk_score_avg": _coerce_non_negative_float(snapshot.get("strategy_risk_score_avg"), 0.0),
+            "high_risk_rate": (high_risk_count / generation_total) if generation_total > 0 else 0.0,
+            "decompose_policy_rate": (decompose_policy_count / generation_total) if generation_total > 0 else 0.0,
+            "dominant_mode": _counter_top_key(strategy_modes),
+            "dominant_policy": _counter_top_key(strategy_policies),
+        }
+    )
+    return point
+
+
+def _persist_route_strategy_trend_points(
+    project_id: int,
+    points: list[dict[str, Any]],
+    captured_at_unix: float,
+    *,
+    max_points: int,
+) -> None:
+    key = _route_observability_strategy_trend_setting_key(project_id)
+    limit = max(6, int(max_points))
+    payload = {
+        "captured_at_unix": float(captured_at_unix),
+        "points": list(points[-limit:]),
+    }
+    try:
+        with connection_lock():
+            con = get_connection()
+            con.execute(
+                "INSERT OR REPLACE INTO metadata.settings (key, value, updated_at) VALUES (?, ?::JSON, CURRENT_TIMESTAMP)",
+                [key, json.dumps(payload)],
+            )
+    except Exception:
+        LOGGER.warning("Failed to persist route strategy trend points for project_id=%d", project_id, exc_info=True)
+
+
+def _load_route_strategy_trend_points(project_id: int, retention_seconds: float, *, max_points: int) -> list[dict[str, Any]]:
+    key = _route_observability_strategy_trend_setting_key(project_id)
+    try:
+        with connection_lock():
+            con = get_connection()
+            row = con.execute("SELECT value FROM metadata.settings WHERE key = ?", [key]).fetchone()
+    except Exception:
+        return []
+    if not row:
+        return []
+
+    raw_value = row[0]
+    parsed: dict[str, Any] | None = None
+    if isinstance(raw_value, dict):
+        parsed = raw_value
+    elif isinstance(raw_value, str):
+        try:
+            loaded = json.loads(raw_value)
+            if isinstance(loaded, dict):
+                parsed = loaded
+        except Exception:
+            parsed = None
+    if not parsed:
+        return []
+
+    return _normalize_strategy_trend_points(
+        parsed.get("points"),
+        retention_seconds=retention_seconds,
+        max_points=max_points,
+    )
+
+
+def _delete_route_strategy_trend_snapshot(project_id: Optional[int] = None) -> None:
+    try:
+        with connection_lock():
+            con = get_connection()
+            if project_id is None:
+                con.execute(
+                    "DELETE FROM metadata.settings WHERE key LIKE ?",
+                    [f"{_ROUTE_OBSERVABILITY_STRATEGY_TREND_KEY_PREFIX}%"],
+                )
+            else:
+                con.execute(
+                    "DELETE FROM metadata.settings WHERE key = ?",
+                    [_route_observability_strategy_trend_setting_key(int(project_id))],
+                )
+    except Exception:
+        LOGGER.warning("Failed to clear persisted strategy trend snapshot", exc_info=True)
 
 
 def _build_window_route_dimension_bucket(
@@ -1755,6 +2162,13 @@ def _load_route_observability_snapshot(project_id: int, window_seconds: int) -> 
         "events_total": _coerce_non_negative_int(parsed.get("events_total"), 0),
         "route_kind": _coerce_counter_map(parsed.get("route_kind")),
         "generation_engine": _coerce_counter_map(parsed.get("generation_engine")),
+        "strategy_selected_engine": _coerce_counter_map(parsed.get("strategy_selected_engine")),
+        "strategy_mode": _coerce_counter_map(parsed.get("strategy_mode")),
+        "strategy_policy": _coerce_counter_map(parsed.get("strategy_policy")),
+        "strategy_risk_level": _coerce_counter_map(parsed.get("strategy_risk_level")),
+        "strategy_risk_score_total": _coerce_non_negative_int(parsed.get("strategy_risk_score_total"), 0),
+        "strategy_risk_score_avg": _coerce_non_negative_float(parsed.get("strategy_risk_score_avg"), 0.0),
+        "strategy_risk_score_max": _coerce_non_negative_int(parsed.get("strategy_risk_score_max"), 0),
         "strict_json_mode": _coerce_counter_map(parsed.get("strict_json_mode")),
         "generation_decision_total": _coerce_non_negative_int(parsed.get("generation_decision_total"), 0),
         "fallback_count_total": _coerce_non_negative_int(parsed.get("fallback_count_total"), 0),
@@ -1830,6 +2244,16 @@ def _minimize_route_dimension_payload(marker: str, payload: dict[str, Any]) -> d
         return compact
     compact["generation_engine"] = str(payload.get("generation_engine") or "unknown")
     compact["strict_json_mode"] = str(payload.get("strict_json_mode") or "none")
+    compact["strategy_selected_engine"] = str(
+        payload.get("strategy_selected_engine") or payload.get("generation_engine") or "unknown"
+    )
+    compact["strategy_mode"] = str(payload.get("strategy_mode") or "legacy_tier")
+    compact["strategy_policy"] = str(payload.get("strategy_policy") or "tier_default")
+    compact["strategy_risk_level"] = str(payload.get("strategy_risk_level") or "low")
+    try:
+        compact["strategy_risk_score"] = max(0, int(payload.get("strategy_risk_score") or 0))
+    except Exception:
+        compact["strategy_risk_score"] = 0
     try:
         compact["fallback_count"] = max(0, int(payload.get("fallback_count") or 0))
     except Exception:
@@ -1898,9 +2322,23 @@ def _apply_route_dimension_event_to_bucket(
 
     generation_engine = str(payload.get("generation_engine") or "unknown")
     strict_json_mode = str(payload.get("strict_json_mode") or "none")
+    strategy_selected_engine = str(payload.get("strategy_selected_engine") or generation_engine)
+    strategy_mode = str(payload.get("strategy_mode") or "legacy_tier")
+    strategy_policy = str(payload.get("strategy_policy") or "tier_default")
+    strategy_risk_level = str(payload.get("strategy_risk_level") or "low")
+    try:
+        strategy_risk_score = max(0, int(payload.get("strategy_risk_score") or 0))
+    except Exception:
+        strategy_risk_score = 0
     bucket["generation_decision_total"] = int(bucket.get("generation_decision_total") or 0) + 1
     _increment_counter(bucket.setdefault("generation_engine", {}), generation_engine)
+    _increment_counter(bucket.setdefault("strategy_selected_engine", {}), strategy_selected_engine)
+    _increment_counter(bucket.setdefault("strategy_mode", {}), strategy_mode)
+    _increment_counter(bucket.setdefault("strategy_policy", {}), strategy_policy)
+    _increment_counter(bucket.setdefault("strategy_risk_level", {}), strategy_risk_level)
     _increment_counter(bucket.setdefault("strict_json_mode", {}), strict_json_mode)
+    bucket["strategy_risk_score_total"] = int(bucket.get("strategy_risk_score_total") or 0) + strategy_risk_score
+    bucket["strategy_risk_score_max"] = max(int(bucket.get("strategy_risk_score_max") or 0), strategy_risk_score)
 
     fallback_count = 0
     try:
@@ -1937,12 +2375,17 @@ def clear_route_dimension_metrics(project_id: Optional[int] = None) -> None:
             _route_dimension_metrics_by_project.clear()
             _route_dimension_events_by_project.clear()
             _route_observability_snapshot_state_by_project.clear()
+            _route_strategy_trend_points_by_project.clear()
+            _route_strategy_trend_snapshot_state_by_project.clear()
         else:
             pid = int(project_id)
             _route_dimension_metrics_by_project.pop(pid, None)
             _route_dimension_events_by_project.pop(pid, None)
             _route_observability_snapshot_state_by_project.pop(pid, None)
+            _route_strategy_trend_points_by_project.pop(pid, None)
+            _route_strategy_trend_snapshot_state_by_project.pop(pid, None)
     _delete_route_observability_snapshot(target_project)
+    _delete_route_strategy_trend_snapshot(target_project)
 
 
 def get_route_dimension_metrics_snapshot(project_id: int) -> dict[str, Any]:
@@ -1979,6 +2422,67 @@ def get_route_dimension_metrics_snapshot(project_id: int) -> dict[str, Any]:
     return _route_dimension_zero_snapshot(window_seconds)
 
 
+def get_route_strategy_trend_history(
+    project_id: int,
+    route_dimensions: Optional[dict[str, Any]] = None,
+) -> list[dict[str, Any]]:
+    pid = int(project_id)
+    window_seconds = _route_observability_window_seconds()
+    retention_seconds = _route_dimension_retention_seconds(window_seconds)
+    max_points = _route_observability_strategy_trend_max_points()
+    now_unix = time.time()
+
+    history_snapshot: list[dict[str, Any]] = []
+    should_load_persisted = False
+    with _route_dimension_metrics_lock:
+        history = _route_strategy_trend_points_by_project.get(pid)
+        if history is not None and history.maxlen != max_points:
+            history = _ensure_strategy_trend_history(pid, max_points)
+        if history:
+            while history and (now_unix - float(history[0].get("captured_at_unix") or 0.0)) > retention_seconds:
+                history.popleft()
+            if not history:
+                _route_strategy_trend_points_by_project.pop(pid, None)
+                _route_strategy_trend_snapshot_state_by_project.pop(pid, None)
+                history = None
+        if history is None:
+            should_load_persisted = True
+        else:
+            history_snapshot = [dict(item) for item in history]
+
+    if should_load_persisted:
+        loaded_points = _load_route_strategy_trend_points(pid, retention_seconds, max_points=max_points)
+        if loaded_points:
+            with _route_dimension_metrics_lock:
+                current = _route_strategy_trend_points_by_project.get(pid)
+                if current is not None and current.maxlen != max_points:
+                    current = _ensure_strategy_trend_history(pid, max_points)
+                if current is None:
+                    current = deque(maxlen=max_points)
+                    for item in loaded_points:
+                        current.append(dict(item))
+                    _route_strategy_trend_points_by_project[pid] = current
+                history_snapshot = [dict(item) for item in current]
+        else:
+            history_snapshot = []
+
+    snapshot = route_dimensions if isinstance(route_dimensions, dict) else None
+    if snapshot is None:
+        snapshot = get_route_dimension_metrics_snapshot(pid)
+    trend_point = _strategy_trend_point_from_snapshot(snapshot, now_unix)
+    if trend_point is None:
+        return history_snapshot
+
+    with _route_dimension_metrics_lock:
+        history = _ensure_strategy_trend_history(pid, max_points)
+        while history and (now_unix - float(history[0].get("captured_at_unix") or 0.0)) > retention_seconds:
+            history.popleft()
+        _append_strategy_trend_point(history, trend_point, max_points=max_points)
+        history_snapshot = [dict(item) for item in history]
+
+    return history_snapshot
+
+
 def _record_route_dimension_metric(event_type: str, payload: dict[str, Any], project_id: int | None) -> None:
     if project_id is None:
         return
@@ -1998,7 +2502,11 @@ def _record_route_dimension_metric(event_type: str, payload: dict[str, Any], pro
     persist_enabled = _route_observability_persist_enabled()
     persist_interval_seconds = _route_observability_persist_interval_seconds()
     persist_event_delta = _route_observability_persist_event_delta()
+    trend_max_points = _route_observability_strategy_trend_max_points()
+    trend_persist_interval_seconds = _route_observability_strategy_trend_persist_interval_seconds()
+    trend_persist_decision_delta = _route_observability_strategy_trend_persist_decision_delta()
     snapshot_to_persist: dict[str, Any] | None = None
+    strategy_trend_points_to_persist: list[dict[str, Any]] | None = None
     with _route_dimension_metrics_lock:
         pid = int(project_id)
         bucket = _route_dimension_metrics_by_project.setdefault(pid, _new_route_dimension_bucket())
@@ -2033,8 +2541,50 @@ def _record_route_dimension_metric(event_type: str, payload: dict[str, Any], pro
                 persist_state["last_persisted_ts"] = now
                 persist_state["last_persisted_events_total"] = float(events_total)
 
+        if marker == "generation_route_decision":
+            trend_snapshot = snapshot_to_persist
+            if trend_snapshot is None:
+                window_bucket = _build_window_route_dimension_bucket(
+                    history,
+                    window_seconds=window_seconds,
+                    now=now,
+                )
+                trend_snapshot = _route_dimension_bucket_snapshot(window_bucket, window_seconds)
+            trend_point = _strategy_trend_point_from_snapshot(trend_snapshot, wall_now)
+            if trend_point is not None:
+                trend_history = _ensure_strategy_trend_history(pid, trend_max_points)
+                history_changed = False
+                while trend_history and (wall_now - float(trend_history[0].get("captured_at_unix") or 0.0)) > retention_seconds:
+                    trend_history.popleft()
+                    history_changed = True
+                appended = _append_strategy_trend_point(trend_history, trend_point, max_points=trend_max_points)
+                if persist_enabled and (appended or history_changed):
+                    trend_state = _route_strategy_trend_snapshot_state_by_project.setdefault(
+                        pid,
+                        {"last_persisted_ts": 0.0, "last_persisted_decision_total": 0.0},
+                    )
+                    last_persisted_ts = float(trend_state.get("last_persisted_ts") or 0.0)
+                    last_persisted_decision_total = int(trend_state.get("last_persisted_decision_total") or 0)
+                    decision_total = int(trend_point.get("decision_total") or 0)
+                    should_persist_trend = (
+                        history_changed
+                        or (now - last_persisted_ts) >= trend_persist_interval_seconds
+                        or (decision_total - last_persisted_decision_total) >= trend_persist_decision_delta
+                    )
+                    if should_persist_trend:
+                        strategy_trend_points_to_persist = [dict(item) for item in trend_history]
+                        trend_state["last_persisted_ts"] = now
+                        trend_state["last_persisted_decision_total"] = float(decision_total)
+
     if snapshot_to_persist is not None:
         _persist_route_observability_snapshot(int(project_id), snapshot_to_persist, wall_now)
+    if persist_enabled and strategy_trend_points_to_persist is not None:
+        _persist_route_strategy_trend_points(
+            int(project_id),
+            strategy_trend_points_to_persist,
+            wall_now,
+            max_points=trend_max_points,
+        )
 
 
 def clear_execution_metrics(project_id: Optional[int] = None) -> None:
@@ -3077,6 +3627,11 @@ def _select_sql_strategy(analysis: dict, has_knowledge: bool) -> dict:
         "engine": strategy.engine,
         "max_retries": strategy.max_retries,
         "use_examples": strategy.use_examples,
+        "mode": strategy.mode,
+        "policy": strategy.policy,
+        "risk_score": strategy.risk_score,
+        "risk_level": strategy.risk_level,
+        "signals": dict(strategy.signals or {}),
     }
 
 
@@ -6377,6 +6932,14 @@ def _validate_duckdb_sql_syntax(sql: str) -> list[str]:
             conn.execute(f"EXPLAIN {normalized_sql}")
             return []
         except Exception as exc:
+            if "[" in normalized_sql and "]" in normalized_sql:
+                bracket_rewritten = _rewrite_bracket_identifiers_for_duckdb(normalized_sql)
+                if bracket_rewritten != normalized_sql:
+                    try:
+                        conn.execute(f"EXPLAIN {bracket_rewritten}")
+                        return []
+                    except Exception as rewritten_exc:
+                        exc = rewritten_exc
             message = _sanitize_error_message(exc, max_length=600)
             lower = message.lower()
             if "duplicate alias" in lower or "alias already used" in lower:
@@ -6739,6 +7302,7 @@ def _decompose_merge_sql(
     guard = _candidate_guard()
     owner_lock_hint = _format_owner_lock_constraints_hint(resolved, schema_link_plan)
     subquery_failure_counts: dict[str, int] = {}
+    merge_failure_counts: dict[str, int] = {}
 
     def _record_subquery_failure(reason: str, sq: str, detail: str | None = None) -> None:
         normalized_reason = str(reason or "returned_none").strip().lower() or "returned_none"
@@ -6766,8 +7330,28 @@ def _decompose_merge_sql(
             failure_meta["detail"] = detail
         if subquery_failure_counts:
             failure_meta["reason_counts"] = dict(subquery_failure_counts)
+        if merge_failure_counts:
+            failure_meta["merge_reason_counts"] = dict(merge_failure_counts)
+
+    def _record_merge_failure(reason: str, detail: str | None = None) -> None:
+        normalized_reason = str(reason or "returned_none").strip().lower() or "returned_none"
+        merge_failure_counts[normalized_reason] = int(merge_failure_counts.get(normalized_reason) or 0) + 1
+        if detail:
+            LOGGER.info(
+                "Decompose-merge merge candidate failed reason=%s detail=%s",
+                normalized_reason,
+                detail,
+            )
+        else:
+            LOGGER.info("Decompose-merge merge candidate failed reason=%s", normalized_reason)
 
     def _stabilize_decompose_candidate(candidate_sql: str, label: str) -> tuple[str | None, list[str], list[str], str | None]:
+        if _contains_sql_placeholder_markers(candidate_sql):
+            LOGGER.warning(
+                "Decompose-merge %s contains placeholder SQL identifiers; rejecting candidate",
+                label,
+            )
+            return None, [], [], "placeholder"
         stabilized = _fix_type_mismatch_multiply(candidate_sql, hit_models) if hit_models else candidate_sql
         inspected = guard.inspect(
             stabilized,
@@ -6956,68 +7540,80 @@ def _decompose_merge_sql(
     merge_parts.append("\nCombine these into a single SQL query that answers the original question.")
     merge_user = "\n".join(merge_parts)
 
-    try:
-        if cancel_check:
-            cancel_check()
-        result = _llm_chat_with_response_format_fallback(
-            llm,
-            [
-                {"role": "system", "content": merge_system},
-                {"role": "user", "content": f"Project prompt:\n{project_prompt}"},
-                {"role": "user", "content": merge_user},
-            ],
-            response_format=response_format,
-            stage="sql_generation_merge",
-        )
-        raw_merge_content = result.get("content", "")
+    merge_candidate_budget = max(1, min(3, int(ROUTER_CONFIG.get("tier3_max_retries", 3) or 3)))
+    for merge_attempt in range(merge_candidate_budget):
+        attempt_label = f"candidate {merge_attempt + 1}/{merge_candidate_budget}"
         try:
-            parsed = parse_json_object(raw_merge_content)
-        except Exception as parse_exc:
-            fallback_sql = _extract_sql_from_llm_text(raw_merge_content)
-            if not fallback_sql:
-                raise parse_exc
-            LOGGER.warning(
-                "Decompose-merge merge response JSON parse failed (%s); using plain-text SQL fallback",
-                parse_exc,
+            if cancel_check:
+                cancel_check()
+            attempt_prompt = merge_user
+            if merge_candidate_budget > 1:
+                attempt_prompt = (
+                    f"{merge_user}\n"
+                    f"Generate merge SQL {attempt_label}. Keep semantics identical while improving validity and stability."
+                )
+            result = _llm_chat_with_response_format_fallback(
+                llm,
+                [
+                    {"role": "system", "content": merge_system},
+                    {"role": "user", "content": f"Project prompt:\n{project_prompt}"},
+                    {"role": "user", "content": attempt_prompt},
+                ],
+                response_format=response_format,
+                stage="sql_generation_merge",
             )
-            parsed = {
-                "sql": fallback_sql,
-                "summary": "Merged SQL for your compound question.",
-                "reasoning": f"Merge JSON parse failed ({type(parse_exc).__name__}); extracted SQL from plain-text fallback.",
-            }
-        merged_sql = _normalize_sql_candidate(parsed.get("sql"))
-        if merged_sql and (validated := _validate_sql_columns(merged_sql, hit_models)) is not None and not validated:
-            orphan = _validate_no_orphaned_cte(merged_sql)
-            if orphan:
-                merged_sql = _repair_sql(
-                    question,
+            raw_merge_content = result.get("content", "")
+            try:
+                parsed = parse_json_object(raw_merge_content)
+            except Exception as parse_exc:
+                fallback_sql = _extract_sql_from_llm_text(raw_merge_content)
+                if not fallback_sql:
+                    _record_merge_failure("parse_error", detail=f"{attempt_label}:{type(parse_exc).__name__}")
+                    continue
+                LOGGER.warning(
+                    "Decompose-merge merge response JSON parse failed (%s); using plain-text SQL fallback",
+                    parse_exc,
+                )
+                parsed = {
+                    "sql": fallback_sql,
+                    "summary": "Merged SQL for your compound question.",
+                    "reasoning": f"Merge JSON parse failed ({type(parse_exc).__name__}); extracted SQL from plain-text fallback.",
+                }
+            merged_sql = _normalize_sql_candidate(parsed.get("sql"))
+            if merged_sql and (validated := _validate_sql_columns(merged_sql, hit_models)) is not None and not validated:
+                orphan = _validate_no_orphaned_cte(merged_sql)
+                if orphan:
+                    merged_sql = _repair_sql(
+                        question,
+                        merged_sql,
+                        "; ".join(orphan),
+                        project_id,
+                        semantic_context,
+                        language,
+                        cancel_check=cancel_check,
+                    ).get("sql") or merged_sql
+                stabilized_sql, _group_issues, agg_issues, stabilize_reason = _stabilize_decompose_candidate(
                     merged_sql,
-                    "; ".join(orphan),
-                    project_id,
-                    semantic_context,
-                    language,
-                    cancel_check=cancel_check,
-                ).get("sql") or merged_sql
-            stabilized_sql, _group_issues, agg_issues, stabilize_reason = _stabilize_decompose_candidate(merged_sql, "merge result")
-            if not stabilized_sql:
-                LOGGER.warning("Decompose-merge merge result is unstable — falling back to direct generation")
-                _set_failure(stabilize_reason or "returned_none", detail="merge_result_unstable")
-                return None
-            if agg_issues:
-                LOGGER.warning("Decompose-merge SQL aggregation issues: %s", agg_issues)
-            return {
-                "sql": stabilized_sql,
-                "summary": parsed.get("summary") or "Merged SQL for your compound question.",
-                "reasoning": parsed.get("reasoning") or f"Merged {len(valid_results)} sub-queries into one SQL.",
-                "retrieved_tables": retrieved_tables,
-                "configured": True,
-                "sql_engine": "decompose_merge",
-            }
-        if not merged_sql:
-            LOGGER.warning("Decompose-merge merge step returned empty SQL — falling back to direct generation")
-            _set_failure("empty", detail="merge_sql_empty")
-            return None
-        if merged_sql:
+                    f"merge result ({attempt_label})",
+                )
+                if not stabilized_sql:
+                    LOGGER.warning("Decompose-merge merge result %s is unstable", attempt_label)
+                    _record_merge_failure(stabilize_reason or "returned_none", detail=f"{attempt_label}:merge_result_unstable")
+                    continue
+                if agg_issues:
+                    LOGGER.warning("Decompose-merge SQL aggregation issues: %s", agg_issues)
+                return {
+                    "sql": stabilized_sql,
+                    "summary": parsed.get("summary") or "Merged SQL for your compound question.",
+                    "reasoning": parsed.get("reasoning") or f"Merged {len(valid_results)} sub-queries into one SQL.",
+                    "retrieved_tables": retrieved_tables,
+                    "configured": True,
+                    "sql_engine": "decompose_merge",
+                }
+            if not merged_sql:
+                LOGGER.warning("Decompose-merge merge step returned empty SQL (%s)", attempt_label)
+                _record_merge_failure("empty", detail=f"{attempt_label}:merge_sql_empty")
+                continue
             rehinted = _rehint_columns(merged_sql, hit_models)
             if rehinted != merged_sql:
                 rehinted_validated = _validate_sql_columns(rehinted, hit_models)
@@ -7035,12 +7631,12 @@ def _decompose_merge_sql(
                         ).get("sql") or rehinted
                     stabilized_rehinted, _rehint_group_issues, rehint_agg_issues, rehint_reason = _stabilize_decompose_candidate(
                         rehinted,
-                        "rehinted merge result",
+                        f"rehinted merge result ({attempt_label})",
                     )
                     if not stabilized_rehinted:
-                        LOGGER.warning("Decompose-merge rehinted SQL is unstable — falling back to direct generation")
-                        _set_failure(rehint_reason or "returned_none", detail="rehinted_merge_unstable")
-                        return None
+                        LOGGER.warning("Decompose-merge rehinted SQL %s is unstable", attempt_label)
+                        _record_merge_failure(rehint_reason or "returned_none", detail=f"{attempt_label}:rehinted_merge_unstable")
+                        continue
                     if rehint_agg_issues:
                         LOGGER.warning("Decompose-merge rehinted SQL aggregation issues: %s", rehint_agg_issues)
                     return {
@@ -7051,16 +7647,25 @@ def _decompose_merge_sql(
                         "configured": True,
                         "sql_engine": "decompose_merge_rehint",
                     }
-        LOGGER.warning("Decompose-merge: merged SQL has bad columns — falling back to direct generation")
-        _set_failure("merged_bad_columns")
-        return None
-    except Exception as e:
-        LOGGER.warning(
-            "Decompose-merge merge step failed: %s — falling back to direct generation",
-            _sanitize_error_message(e),
-        )
-        _set_failure("returned_none", detail=type(e).__name__)
-        return None
+            LOGGER.warning("Decompose-merge merged SQL has bad columns (%s)", attempt_label)
+            _record_merge_failure("merged_bad_columns", detail=attempt_label)
+        except Exception as e:
+            LOGGER.warning(
+                "Decompose-merge merge %s failed: %s",
+                attempt_label,
+                _sanitize_error_message(e),
+            )
+            _record_merge_failure("returned_none", detail=f"{attempt_label}:{type(e).__name__}")
+
+    ranked_merge_failures = sorted(merge_failure_counts.items(), key=lambda item: (-item[1], item[0]))
+    primary_reason = ranked_merge_failures[0][0] if ranked_merge_failures else "returned_none"
+    _set_failure(primary_reason, detail=f"merge_candidate_failures={dict(merge_failure_counts)}")
+    LOGGER.warning(
+        "Decompose-merge merge step exhausted %d candidate(s) (reasons=%s) — falling back to direct generation",
+        merge_candidate_budget,
+        merge_failure_counts or {primary_reason: 1},
+    )
+    return None
 
 
 def _format_sql_clause_focus_hint(analysis: Optional[dict[str, Any]]) -> str:
@@ -7137,6 +7742,28 @@ def _generate_sql(
     had_compound_fallback = False
     # Decompose & Merge for compound questions
     normalized_sub_questions = _normalize_analysis_string_list((analysis or {}).get("sub_questions"))
+    decompose_merge_enabled = bool(ROUTER_CONFIG.get("decompose_merge_enabled", True))
+    if engine_label == "decompose_merge" and not decompose_merge_enabled:
+        target_engine = "fewshot_cot"
+        if len(normalized_sub_questions) <= 1 and len((analysis or {}).get("dimensions") or []) <= 1:
+            target_engine = "direct_llm"
+        LOGGER.info(
+            "Decompose-merge disabled via router settings; using %s generation",
+            target_engine,
+        )
+        if emit_route_events:
+            _emit_route_event(
+                "sql_generation_fallback",
+                {
+                    "from_engine": "decompose_merge",
+                    "to_engine": target_engine,
+                    "reason": "decompose_disabled",
+                    "sub_question_count": len(normalized_sub_questions),
+                },
+                project_id=project_id,
+            )
+        engine_label = target_engine
+        had_compound_fallback = target_engine == "direct_llm"
     if engine_label == "decompose_merge" and normalized_sub_questions:
         if len(normalized_sub_questions) == 1:
             LOGGER.info(
@@ -10584,6 +11211,83 @@ def ask_question(
     non_metadata_part_for_event = ""
     clause_routing_for_event: dict[str, Any] = _event_clause_routing_summary({})
     ask_started_at = time.perf_counter()
+    stage_order = ("understand", "retrieve", "generate", "execute", "answer")
+    stage_durations_ms: dict[str, float] = {stage: 0.0 for stage in stage_order}
+    active_stage = "understand"
+    active_stage_started_at = ask_started_at
+    attempt_count_for_event = 0
+    fallback_chain_for_event: list[str] = []
+
+    def _normalize_attempt_count(value: Any, *, default: int = 0) -> int:
+        try:
+            return max(0, int(value))
+        except Exception:
+            return max(0, int(default))
+
+    def _append_unique(bucket: list[str], marker: Any) -> None:
+        normalized = str(marker or "").strip()
+        if not normalized or normalized.lower() == "none":
+            return
+        if normalized not in bucket:
+            bucket.append(normalized)
+
+    def _extend_fallback_chain(markers: Any) -> None:
+        if isinstance(markers, (list, tuple, set)):
+            for marker in markers:
+                _append_unique(fallback_chain_for_event, marker)
+            return
+        if isinstance(markers, str):
+            _append_unique(fallback_chain_for_event, markers)
+
+    def _fallback_chain_from_sql_engine(sql_engine: Any) -> list[str]:
+        engine = str(sql_engine or "").strip().lower()
+        if not engine:
+            return []
+        chain: list[str] = []
+        if engine.startswith("decompose_merge") and engine != "decompose_merge":
+            chain.append("decompose_merge_fallback")
+        if "_rehint" in engine:
+            chain.append("generation_rehint")
+        if "_repair" in engine:
+            chain.append("generation_repair")
+        if "validation_circuit_open" in engine:
+            chain.append("validation_circuit_open")
+        if "_failed" in engine or engine.startswith("llm_fallback"):
+            chain.append("generation_failed")
+        return chain
+
+    def _record_generated_observability(generated_payload: dict[str, Any]) -> None:
+        nonlocal attempt_count_for_event
+        payload = generated_payload if isinstance(generated_payload, dict) else {}
+        if not payload:
+            return
+        generated_attempt_count = payload.get("attempt_count")
+        if generated_attempt_count is None:
+            generated_attempt_count = 1 if payload.get("sql") or payload.get("sql_engine") else 0
+        attempt_count_for_event = max(
+            attempt_count_for_event,
+            _normalize_attempt_count(generated_attempt_count, default=0),
+        )
+        _extend_fallback_chain(payload.get("fallback_chain"))
+        _extend_fallback_chain(_fallback_chain_from_sql_engine(payload.get("sql_engine")))
+
+    def _flush_active_stage(*, now: float | None = None) -> None:
+        nonlocal active_stage_started_at
+        current_ts = float(now if now is not None else time.perf_counter())
+        elapsed_ms = max(0.0, (current_ts - active_stage_started_at) * 1000.0)
+        stage_durations_ms[active_stage] = float(stage_durations_ms.get(active_stage) or 0.0) + elapsed_ms
+        active_stage_started_at = current_ts
+
+    def _switch_stage(stage: str) -> None:
+        nonlocal active_stage
+        normalized_stage = str(stage or "").strip().lower()
+        if normalized_stage not in stage_durations_ms:
+            return
+        if normalized_stage == active_stage:
+            return
+        now_ts = time.perf_counter()
+        _flush_active_stage(now=now_ts)
+        active_stage = normalized_stage
 
     def _assert_not_cancelled(stage: str) -> None:
         if cancel_event is not None and cancel_event.is_set():
@@ -10618,12 +11322,35 @@ def ask_question(
         has_sql: bool | None = None,
         repair_path: str | None = None,
         duration_ms: float | None = None,
+        attempt_count: int | None = None,
+        fallback_chain: list[str] | None = None,
     ) -> None:
         if not emit_route_events or project_id is None:
             return
+        _flush_active_stage()
         elapsed_ms = duration_ms
         if elapsed_ms is None:
             elapsed_ms = max(0.0, (time.perf_counter() - ask_started_at) * 1000.0)
+        terminal_attempt_count = _normalize_attempt_count(
+            attempt_count if attempt_count is not None else attempt_count_for_event,
+            default=0,
+        )
+        if terminal_attempt_count <= 0 and bool(has_sql):
+            terminal_attempt_count = 1
+        terminal_fallback_chain: list[str] = []
+        for marker in fallback_chain_for_event:
+            _append_unique(terminal_fallback_chain, marker)
+        for marker in _fallback_chain_from_sql_engine(sql_engine):
+            _append_unique(terminal_fallback_chain, marker)
+        if repair_path is not None:
+            for marker in str(repair_path).split("+"):
+                _append_unique(terminal_fallback_chain, marker)
+        if fallback_chain is not None:
+            if isinstance(fallback_chain, list):
+                for marker in fallback_chain:
+                    _append_unique(terminal_fallback_chain, marker)
+            else:
+                _append_unique(terminal_fallback_chain, fallback_chain)
         payload: dict[str, Any] = {
             "metadata_question_part": metadata_part_for_event,
             "non_metadata_question_part": non_metadata_part_for_event,
@@ -10634,6 +11361,12 @@ def ask_question(
             "route_v2_enabled": route_v2_enabled,
             "shadow_mode": shadow_mode,
             "duration_ms": float(elapsed_ms),
+            "stage_durations_ms": {
+                stage: round(float(stage_durations_ms.get(stage) or 0.0), 3)
+                for stage in stage_order
+            },
+            "attempt_count": int(terminal_attempt_count),
+            "fallback_chain": terminal_fallback_chain,
         }
         if query_id is not None:
             payload["query_id"] = query_id
@@ -10676,6 +11409,7 @@ def ask_question(
         )
     if not project_id or not _project_has_context(project_id):
         _assert_not_cancelled("general_chat")
+        _switch_stage("answer")
         result = _general_chat(question, previous_questions, previous_answers, language)
         answer_detail = {
             "status": "FINISHED" if result.get("configured") else "FAILED",
@@ -10722,6 +11456,7 @@ def ask_question(
 
     if _looks_like_general_chat(question):
         _assert_not_cancelled("project_general_chat")
+        _switch_stage("answer")
         metadata_summary = _build_metadata_summary(project_id) if project_id else None
         result = _project_general_chat(question, project_id, previous_questions, previous_answers, language=language, metadata_summary=metadata_summary)
         answer_detail = {
@@ -10779,6 +11514,7 @@ def ask_question(
             progress_cb("understand", _step_title("understand", language))
         _assert_not_cancelled("analyze_question")
         analysis = _analyze_question(question, project_id, previous_questions)
+        _switch_stage("retrieve")
         route = _classify_question_route(question, project_id, previous_questions, analysis)
         metadata_part = route.get("metadata_question_part") or question
         non_metadata_part = route.get("non_metadata_question_part") or ""
@@ -10840,8 +11576,22 @@ def ask_question(
                 fallback_chain=fallback_chain,
             )
             payload = decision.to_audit_payload()
+            strategy_payload = _select_sql_strategy(
+                analysis_for_sql if requires_sql else analysis,
+                bool(route.get("knowledge_context")),
+            )
             payload.update(
                 {
+                    "strategy_selected_engine": str(strategy_payload.get("engine") or "direct_llm"),
+                    "strategy_mode": str(strategy_payload.get("mode") or "legacy_tier"),
+                    "strategy_policy": str(strategy_payload.get("policy") or "tier_default"),
+                    "strategy_risk_score": int(strategy_payload.get("risk_score") or 0),
+                    "strategy_risk_level": str(strategy_payload.get("risk_level") or "low"),
+                    "strategy_signals": (
+                        strategy_payload.get("signals")
+                        if isinstance(strategy_payload.get("signals"), dict)
+                        else {}
+                    ),
                     "clause_routing": clause_routing_for_event,
                     "clause_mixed": bool(clause_routing_for_event.get("mixed")),
                     "metadata_clause_count": int(clause_routing_for_event.get("metadata_clause_count") or 0),
@@ -10873,6 +11623,7 @@ def ask_question(
         if not route.get("requires_sql"):
             _assert_not_cancelled("non_sql_answer")
             _emit_generation_decision({}, requires_sql=False)
+            _switch_stage("answer")
             result = _project_general_chat(non_metadata_part or question, project_id, previous_questions, previous_answers, route.get("combined_context"), language, route.get("metadata_summary"))
             answer_detail = {
                 "status": "FINISHED" if result.get("configured") else "FAILED",
@@ -10920,6 +11671,7 @@ def ask_question(
 
         if progress_cb:
             progress_cb("retrieve", _step_title("retrieve", language))
+        _switch_stage("generate")
         _assert_not_cancelled("generate_sql")
         generated = _generate_sql(
             metadata_part,
@@ -10933,6 +11685,7 @@ def ask_question(
             analysis_for_sql,
             cancel_check=lambda: _assert_not_cancelled("generate_sql"),
         )
+        _record_generated_observability(generated)
         _emit_generation_decision(generated, requires_sql=True)
         sql = generated.get("sql")
         if progress_cb:
@@ -10940,8 +11693,10 @@ def ask_question(
         if not sql:
             generation_reason = generated.get("reasoning") or generated.get("summary") or "Failed to generate SQL."
             LOGGER.warning("SQL generation returned no SQL for thread %s: %s", thread_id, generation_reason)
+            _switch_stage("answer")
             fallback = _fallback_answer_after_sql_failure(question, project_id, generation_reason, previous_questions, previous_answers, language) if non_metadata_part else {"content": None, "configured": False}
             if fallback.get("configured") and fallback.get("content"):
+                _append_unique(fallback_chain_for_event, "answer_fallback")
                 answer_detail = {
                     "status": "FINISHED",
                     "content": fallback["content"],
@@ -11040,6 +11795,7 @@ def ask_question(
         repair_reasoning = None
         if progress_cb:
             progress_cb("execute", _step_title("execute", language))
+        _switch_stage("execute")
         _assert_not_cancelled("execute_sql")
         try:
             query_result = execute_project_sql(sql, project_id, user_id, preview_row_limit)
@@ -11101,7 +11857,9 @@ def ask_question(
                 raise ValueError("; ".join(repair_validation_errors))
             query_result = execute_project_sql(repaired_sql, project_id, user_id, preview_row_limit)
             sql = repaired_sql
+            _append_unique(fallback_chain_for_event, "execution_repair")
         generated_content = generated.get("summary") or f"Returned {query_result['total_rows']} rows."
+        _switch_stage("answer")
         _assert_not_cancelled("summarize_result")
         sql_content = _summarize_query_result(
             metadata_part,
