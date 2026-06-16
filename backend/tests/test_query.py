@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 
@@ -423,7 +424,7 @@ class TestExecuteQuery:
                 "strategy_risk_level": "medium",
                 "strict_json_mode": "json_schema",
                 "fallback_count": 1,
-                "fallback_chain": ["repair"],
+                "fallback_chain": ["json_reask", "repair", "execution_repair"],
             },
             project_id=1,
         )
@@ -453,6 +454,14 @@ class TestExecuteQuery:
             project_id=1,
         )
         ask_service._emit_route_event(
+            "sql_validation_issue",
+            {
+                "stage": "validate_sql_columns",
+                "issue_buckets": {"wrong_alias_owner": 2},
+            },
+            project_id=1,
+        )
+        ask_service._emit_route_event(
             "repair_guard_blocked",
             {
                 "issue_buckets": {"duplicate_alias": 1},
@@ -464,6 +473,10 @@ class TestExecuteQuery:
             "sql_repair_short_circuit",
             {
                 "reason": "column_validation",
+                "issue_bucket": "wrong_alias_owner",
+                "dominant_issue_bucket": "ambiguous_owner",
+                "issue_bucket_streak": 1,
+                "circuitable_issue_bucket_streak": 2,
                 "attempt": 1,
                 "max_retries": 2,
                 "generation_engine": "fewshot_cot",
@@ -495,6 +508,35 @@ class TestExecuteQuery:
             },
             project_id=1,
         )
+        ask_service._emit_route_event(
+            "sql_generation_decompose_stage",
+            {
+                "sub_question_count": 2,
+                "elapsed_ms": 123.4,
+                "stage_budget_seconds": 60,
+                "remaining_total_budget_seconds": 10,
+                "status": "fallback",
+                "reason": "budget_exceeded",
+            },
+            project_id=1,
+        )
+        ask_service._emit_route_event(
+            "duckdb_did_you_mean_fix",
+            {
+                "status": "applied",
+                "retry_index": 1,
+                "retry_limit": 1,
+                "allow_internal_tables": False,
+            },
+            project_id=1,
+        )
+        ask_service._emit_route_event(
+            "duckdb_did_you_mean_fix",
+            {
+                "status": "skipped",
+            },
+            project_id=1,
+        )
 
         response = test_app.get(
             "/api/query/metrics?project_id=1&include_route_dimensions=true",
@@ -516,20 +558,55 @@ class TestExecuteQuery:
         assert data["route_dimensions"]["generation_retry_reason"]["empty_llm_content"] >= 1
         assert data["route_dimensions"]["llm_empty_response_retry"] >= 1
         assert data["route_dimensions"]["validation_issue_bucket"]["duplicate_alias"] >= 3
+        assert data["route_dimensions"]["validation_issue_bucket_transition"]["duplicate_alias->wrong_alias_owner"] >= 1
         assert data["route_dimensions"]["repair_guard_blocked"] >= 1
         assert data["route_dimensions"]["repair_short_circuit"] >= 1
         assert data["route_dimensions"]["repair_short_circuit_reason"]["column_validation"] >= 1
+        assert data["route_dimensions"]["repair_short_circuit_issue_bucket"]["wrong_alias_owner"] >= 1
+        assert data["route_dimensions"]["repair_short_circuit_dominant_issue_bucket"]["ambiguous_owner"] >= 1
+        assert data["route_dimensions"]["repair_short_circuit_issue_bucket_streak_max"] >= 1
+        assert data["route_dimensions"]["repair_short_circuit_circuitable_issue_bucket_streak_max"] >= 2
+        assert data["route_dimensions"]["generation_fallback_chain_step"]["repair"] >= 1
+        assert data["route_dimensions"]["generation_fallback_chain_step"]["execution_repair"] >= 1
+        assert data["route_dimensions"]["generation_fallback_chain_pattern"]["json_reask>repair>execution_repair"] >= 1
         assert data["route_dimensions"]["schema_link_fallback_total"] >= 1
         assert data["route_dimensions"]["schema_link_fallback_reason"]["empty_content"] >= 1
         assert data["route_dimensions"]["sql_generation_fallback_total"] >= 1
         assert data["route_dimensions"]["sql_generation_fallback_reason"]["group_by"] >= 1
         assert data["route_dimensions"]["final_answer_fallback_total"] >= 1
         assert data["route_dimensions"]["final_answer_fallback_reason"]["ungrounded_summary"] >= 1
+        assert data["route_dimensions"]["decompose_stage_total"] >= 1
+        assert data["route_dimensions"]["decompose_stage_status"]["fallback"] >= 1
+        assert data["route_dimensions"]["decompose_stage_reason"]["budget_exceeded"] >= 1
+        assert data["route_dimensions"]["decompose_stage_budget_exceeded"] >= 1
+        assert data["route_dimensions"]["decompose_stage_elapsed_ms_avg"] >= 100.0
+        assert data["route_dimensions"]["decompose_stage_elapsed_ms_p50"] >= 100.0
+        assert data["route_dimensions"]["decompose_stage_elapsed_ms_p95"] >= 100.0
+        assert data["route_dimensions"]["decompose_stage_elapsed_ms_max"] >= 123.4
+        assert data["route_dimensions"]["duckdb_did_you_mean_fix_total"] >= 2
+        assert data["route_dimensions"]["duckdb_did_you_mean_fix_status"]["applied"] >= 1
+        assert data["route_dimensions"]["duckdb_did_you_mean_fix_applied"] >= 1
         assert data["route_dimensions"]["generation_decision_total"] >= 1
         assert data["route_dimensions"]["schema_link_fallback_rate"] >= 0.0
         assert data["route_dimensions"]["sql_generation_fallback_rate"] >= 0.0
         assert data["route_dimensions"]["final_answer_fallback_rate"] >= 0.0
         assert data["route_dimensions"]["window_seconds"] == ask_service.ROUTER_CONFIG["route_observability_window_seconds"]
+        assert data["route_dimensions"]["route_alert_repair_timeout_short_circuit_warning_rate"] == ask_service.ROUTER_CONFIG["route_alert_repair_timeout_short_circuit_warning_rate"]
+        assert data["route_dimensions"]["route_alert_repair_timeout_short_circuit_critical_rate"] == ask_service.ROUTER_CONFIG["route_alert_repair_timeout_short_circuit_critical_rate"]
+        assert data["route_dimensions"]["route_alert_repair_timeout_short_circuit_min_warning_events"] == ask_service.ROUTER_CONFIG["route_alert_repair_timeout_short_circuit_min_warning_events"]
+        assert data["route_dimensions"]["route_alert_repair_timeout_short_circuit_min_critical_events"] == ask_service.ROUTER_CONFIG["route_alert_repair_timeout_short_circuit_min_critical_events"]
+        assert data["route_dimensions"]["route_alert_repair_budget_low_short_circuit_warning_rate"] == ask_service.ROUTER_CONFIG["route_alert_repair_budget_low_short_circuit_warning_rate"]
+        assert data["route_dimensions"]["route_alert_repair_budget_low_short_circuit_critical_rate"] == ask_service.ROUTER_CONFIG["route_alert_repair_budget_low_short_circuit_critical_rate"]
+        assert data["route_dimensions"]["route_alert_repair_budget_low_short_circuit_min_warning_events"] == ask_service.ROUTER_CONFIG["route_alert_repair_budget_low_short_circuit_min_warning_events"]
+        assert data["route_dimensions"]["route_alert_repair_budget_low_short_circuit_min_critical_events"] == ask_service.ROUTER_CONFIG["route_alert_repair_budget_low_short_circuit_min_critical_events"]
+        assert data["route_dimensions"]["route_alert_json_reask_warning_rate"] == ask_service.ROUTER_CONFIG["route_alert_json_reask_warning_rate"]
+        assert data["route_dimensions"]["route_alert_json_reask_critical_rate"] == ask_service.ROUTER_CONFIG["route_alert_json_reask_critical_rate"]
+        assert data["route_dimensions"]["route_alert_json_reask_min_warning_decisions"] == ask_service.ROUTER_CONFIG["route_alert_json_reask_min_warning_decisions"]
+        assert data["route_dimensions"]["route_alert_json_reask_min_critical_decisions"] == ask_service.ROUTER_CONFIG["route_alert_json_reask_min_critical_decisions"]
+        assert data["route_dimensions"]["route_alert_decompose_cancelled_warning_rate"] == ask_service.ROUTER_CONFIG["route_alert_decompose_cancelled_warning_rate"]
+        assert data["route_dimensions"]["route_alert_decompose_cancelled_critical_rate"] == ask_service.ROUTER_CONFIG["route_alert_decompose_cancelled_critical_rate"]
+        assert data["route_dimensions"]["route_alert_decompose_cancelled_min_warning_events"] == ask_service.ROUTER_CONFIG["route_alert_decompose_cancelled_min_warning_events"]
+        assert data["route_dimensions"]["route_alert_decompose_cancelled_min_critical_events"] == ask_service.ROUTER_CONFIG["route_alert_decompose_cancelled_min_critical_events"]
         assert isinstance(data["strategy_trend_history"], list)
         assert len(data["strategy_trend_history"]) >= 1
         latest_trend = data["strategy_trend_history"][-1]
@@ -1708,3 +1785,110 @@ def test_execute_duckdb_semantic_query_rewrites_group_by_binder_error_during_pre
         for sql in executed_sql
     )
     assert result["rows"] == [{"product_id": "p1", "total_revenue": 100.0}]
+
+
+def test_execute_duckdb_semantic_query_normalizes_dataset_suffix_table_names(monkeypatch, tmp_path):
+    import services.ask_service as ask_service
+
+    db_path = tmp_path / "mock.duckdb"
+    db_path.write_text("", encoding="utf-8")
+
+    executed_sql: list[str] = []
+
+    class FakeResult:
+        def __init__(self, rows: list[tuple[str]] | None = None):
+            self.description = [("order_id", None, None, None, None, None, None)]
+            self._rows = rows or [("o1",)]
+
+        def fetchmany(self, row_limit: int):
+            return self._rows[:row_limit]
+
+    class FakeConn:
+        def execute(self, sql: str):
+            executed_sql.append(sql)
+            return FakeResult()
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        ask_service,
+        "_resolve_duckdb_path",
+        lambda _props, _project_id, _binding_id: str(db_path),
+    )
+    monkeypatch.setattr(ask_service.duckdb, "connect", lambda _path: FakeConn())
+
+    result = ask_service._execute_duckdb_semantic_query(
+        project_id=1,
+        planned_sql=(
+            "SELECT o.order_id "
+            "FROM olist_orders o "
+            "INNER JOIN olist_order_items oi ON o.order_id = oi.order_id"
+        ),
+        row_limit=10,
+        plan={"security": {"cls": []}},
+        start=time.perf_counter(),
+        bindings=[(1, "duckdb", {})],
+        models_by_binding={
+            1: [
+                {
+                    "name": "olist_orders_dataset",
+                    "table_reference": "olist_orders_dataset",
+                    "source_binding_id": 1,
+                    "columns": ["order_id"],
+                },
+                {
+                    "name": "olist_order_items_dataset",
+                    "table_reference": "olist_order_items_dataset",
+                    "source_binding_id": 1,
+                    "columns": ["order_id"],
+                },
+            ]
+        },
+    )
+
+    explain_calls = [sql for sql in executed_sql if sql.lower().startswith("explain")]
+    assert explain_calls
+    explain_sql = explain_calls[0].lower()
+    assert "olist_orders_dataset" in explain_sql
+    assert "olist_order_items_dataset" in explain_sql
+    assert re.search(r"\bolist_orders\b", explain_sql) is None
+    assert re.search(r"\bolist_order_items\b", explain_sql) is None
+    assert result["rows"] == [{"order_id": "o1"}]
+
+
+def test_try_duckdb_did_you_mean_fix_blocks_internal_table_suggestion():
+    import services.ask_service as ask_service
+
+    sql = "SELECT order_id FROM ordres"
+    error_msg = "Catalog Error: Table with name ordres does not exist! Did you mean duckdb_types?"
+
+    fixed_sql = ask_service._try_duckdb_did_you_mean_fix(
+        sql,
+        error_msg,
+        semantic_visible_tables={"orders"},
+        allow_internal_tables=False,
+    )
+
+    assert fixed_sql is None
+
+
+def test_try_duckdb_did_you_mean_fix_requires_semantic_visible_table():
+    import services.ask_service as ask_service
+
+    sql = "SELECT order_id FROM ordres"
+    visible_fix = ask_service._try_duckdb_did_you_mean_fix(
+        sql,
+        "Catalog Error: Table with name ordres does not exist! Did you mean orders?",
+        semantic_visible_tables={"orders", "sales.orders"},
+        allow_internal_tables=False,
+    )
+    hidden_fix = ask_service._try_duckdb_did_you_mean_fix(
+        sql,
+        "Catalog Error: Table with name ordres does not exist! Did you mean customers?",
+        semantic_visible_tables={"orders", "sales.orders"},
+        allow_internal_tables=False,
+    )
+
+    assert visible_fix == "SELECT order_id FROM orders"
+    assert hidden_fix is None

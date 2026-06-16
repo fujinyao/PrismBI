@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 import services.ask_service as ask_service
 
@@ -126,7 +127,7 @@ def test_generate_sql_complex_olist_multidimension(monkeypatch):
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             return {"content": json.dumps({"sql": expected_sql, "summary": "ok", "reasoning": "ok"})}
 
     monkeypatch.setattr(ask_service, "LLMService", FakeLLM)
@@ -182,7 +183,7 @@ def test_generate_sql_complex_hr_current_top_earners(monkeypatch):
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             return {"content": json.dumps({"sql": expected_sql, "summary": "ok", "reasoning": "ok"})}
 
     monkeypatch.setattr(ask_service, "LLMService", FakeLLM)
@@ -241,7 +242,7 @@ def test_generate_sql_compound_decompose_merge_with_complex_questions(monkeypatc
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             self.call_idx += 1
             user_text = "\n".join(m.get("content", "") for m in messages if m.get("role") == "user")
             if "Sub-question:" in user_text:
@@ -298,7 +299,7 @@ def test_generate_sql_compound_decompose_merge_single_subquery_supports_cjk_dime
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             user_text = "\n".join(m.get("content", "") for m in messages if m.get("role") == "user")
             if "Sub-question:" in user_text:
                 return {"content": json.dumps({"sql": sub_sql, "summary": "sub", "reasoning": "sub"})}
@@ -365,7 +366,7 @@ def test_generate_sql_with_requested_question_product_city_performance(monkeypat
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             return {"content": json.dumps({"sql": expected_sql, "summary": "ok", "reasoning": "ok"})}
 
     monkeypatch.setattr(ask_service, "LLMService", FakeLLM)
@@ -414,7 +415,7 @@ def test_generate_sql_with_requested_question_department_or_title_salary(monkeyp
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             return {"content": json.dumps({"sql": expected_sql, "summary": "ok", "reasoning": "ok"})}
 
     monkeypatch.setattr(ask_service, "LLMService", FakeLLM)
@@ -473,7 +474,7 @@ def test_generate_sql_compound_decompose_merge_accepts_plain_text_merge_sql(monk
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             user_text = "\n".join(m.get("content", "") for m in messages if m.get("role") == "user")
             if "Sub-question:" in user_text:
                 self.sub_count += 1
@@ -552,19 +553,21 @@ def test_generate_sql_compound_decompose_merge_retries_merge_candidate_after_pla
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             user_text = "\n".join(m.get("content", "") for m in messages if m.get("role") == "user")
             if "Sub-question:" in user_text:
                 self.sub_count += 1
                 sql = sub_sql_1 if self.sub_count == 1 else sub_sql_2
                 return {"content": json.dumps({"sql": sql, "summary": "sub", "reasoning": "sub"})}
-            if "Combine these into a single SQL query" in user_text:
+            if "Merge these sub-queries into a single SQL query" in user_text:
                 self.merge_count += 1
                 sql = placeholder_merge_sql if self.merge_count == 1 else merged_sql
                 return {"content": json.dumps({"sql": sql, "summary": "merged", "reasoning": "merged"})}
+
             return {"content": json.dumps({"sql": merged_sql, "summary": "direct", "reasoning": "direct"})}
 
     monkeypatch.setattr(ask_service, "LLMService", FakeLLM)
+
 
     result = ask_service._generate_sql(
         question="先看产品类目销售额，再看城市订单量，并合并成一个结果",
@@ -621,7 +624,7 @@ def test_generate_sql_compound_decompose_merge_circuit_breaker_skips_unstable_me
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             return {"content": json.dumps({"sql": direct_sql, "summary": "ok", "reasoning": "direct"})}
 
     monkeypatch.setattr(ask_service, "LLMService", FakeLLM)
@@ -651,7 +654,7 @@ def test_generate_sql_compound_decompose_merge_circuit_breaker_skips_unstable_me
         )
         assert result["sql"] == direct_sql
 
-    assert calls["decompose"] == 2
+    assert calls["decompose"] == 3
     assert ask_service._is_decompose_merge_temporarily_disabled(1) is True
     ask_service._decompose_merge_state_by_project.clear()
 
@@ -685,7 +688,7 @@ def test_generate_sql_compound_propagates_decompose_failure_reason(monkeypatch):
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             return {"content": json.dumps({"sql": direct_sql, "summary": "ok", "reasoning": "direct"})}
 
     monkeypatch.setattr(ask_service, "_decompose_merge_sql", fake_decompose)
@@ -716,6 +719,202 @@ def test_generate_sql_compound_propagates_decompose_failure_reason(monkeypatch):
     assert result["sql"] == direct_sql
     assert str(result["sql_engine"]).startswith("direct_llm")
     assert captured["reason"] == "bad_columns"
+
+
+def test_generate_sql_compound_falls_back_when_decompose_stage_budget_is_zero(monkeypatch):
+    _patch_prompt_helpers(monkeypatch)
+    ask_service._decompose_merge_state_by_project.clear()
+    monkeypatch.setitem(ask_service.ROUTER_CONFIG, "decompose_merge_stage_budget_s", 0.0)
+
+    direct_sql = (
+        "SELECT t.product_category_name_english, s.seller_city, SUM(oi.price) AS total_sales "
+        "FROM olist_order_items_dataset oi "
+        "JOIN olist_products_dataset p ON oi.product_id = p.product_id "
+        "JOIN product_category_name_translation t ON p.product_category_name = t.product_category_name "
+        "JOIN olist_sellers_dataset s ON oi.seller_id = s.seller_id "
+        "GROUP BY t.product_category_name_english, s.seller_city"
+    )
+    llm_calls = {"count": 0}
+
+    class FakeLLM:
+        def is_configured(self):
+            return True
+
+        def chat(self, messages, response_format="json", **kwargs):
+            llm_calls["count"] += 1
+            return {"content": json.dumps({"sql": direct_sql, "summary": "direct", "reasoning": "direct"})}
+
+    monkeypatch.setattr(ask_service, "LLMService", FakeLLM)
+
+    result = ask_service._generate_sql(
+        question="先看产品类目销售额，再看城市订单量，并合并成一个结果",
+        project_id=1,
+        semantic_context="ctx",
+        retrieved_tables=[
+            "olist_order_items_dataset",
+            "olist_products_dataset",
+            "product_category_name_translation",
+            "olist_sellers_dataset",
+        ],
+        semantic_hits=_olist_hits(),
+        analysis={
+            "tier": "compound",
+            "dimensions": ["Product", "City"],
+            "metrics": ["Sales", "Order Count"],
+            "entities": [],
+            "sub_questions": ["按产品", "按城市"],
+        },
+        language="zh",
+    )
+
+    assert result["sql"] == direct_sql
+    assert str(result["sql_engine"]).startswith("direct_llm")
+    assert llm_calls["count"] == 1
+
+
+def test_decompose_merge_stage_budget_timeout_returns_quickly(monkeypatch):
+    _patch_prompt_helpers(monkeypatch)
+
+    class SlowLLM:
+        def is_configured(self):
+            return True
+
+        def chat(self, messages, response_format="json", **kwargs):
+            time.sleep(0.05)
+            return {
+                "content": json.dumps(
+                    {
+                        "sql": "SELECT 1",
+                        "summary": "slow",
+                        "reasoning": "slow",
+                    }
+                )
+            }
+
+    monkeypatch.setattr(ask_service, "LLMService", SlowLLM)
+
+    failure_meta: dict[str, object] = {}
+    started = time.perf_counter()
+    result = ask_service._decompose_merge_sql(
+        question="先看产品类目销售额，再看城市订单量",
+        project_id=1,
+        analysis={
+            "tier": "compound",
+            "dimensions": ["Product", "City"],
+            "metrics": ["Sales", "Order Count"],
+            "entities": [],
+            "sub_questions": ["按产品", "按城市"],
+        },
+        semantic_context="ctx",
+        retrieved_tables=[
+            "olist_order_items_dataset",
+            "olist_products_dataset",
+            "product_category_name_translation",
+            "olist_sellers_dataset",
+        ],
+        semantic_hits=_olist_hits(),
+        previous_questions=None,
+        language="zh",
+        knowledge_context=None,
+        resolved=None,
+        schema_link_plan=None,
+        cancel_check=None,
+        failure_meta=failure_meta,
+        stage_budget_s=0.01,
+    )
+    elapsed = time.perf_counter() - started
+
+    assert result is None
+    assert str(failure_meta.get("reason") or "") in {"budget_exceeded", "timed_out"}
+    assert float(failure_meta.get("elapsed_ms") or 0.0) >= 0.0
+    assert elapsed < 0.25
+
+
+def test_decompose_merge_cancels_pending_subquery_futures_on_timeout(monkeypatch):
+    _patch_prompt_helpers(monkeypatch)
+
+    done_future_result = (
+        "SELECT SUM(oi.price) AS total_sales FROM olist_order_items_dataset oi",
+        "sub",
+        "ok",
+    )
+
+    class FakeFuture:
+        def __init__(self, result=None, done=False):
+            self._result = result
+            self._done = done
+            self.cancel_called = False
+
+        def result(self):
+            return self._result
+
+        def done(self):
+            return self._done
+
+        def cancel(self):
+            self.cancel_called = True
+            self._done = True
+            return True
+
+    finished_future = FakeFuture(result=done_future_result, done=True)
+    pending_future = FakeFuture(done=False)
+    executor_state = {"instance": None}
+
+    class FakeExecutor:
+        def __init__(self, *args, **kwargs):
+            self.submit_count = 0
+            self.shutdown_args = None
+            executor_state["instance"] = self
+
+        def submit(self, fn, sq):
+            self.submit_count += 1
+            return finished_future if self.submit_count == 1 else pending_future
+
+        def shutdown(self, wait=False, cancel_futures=False):
+            self.shutdown_args = (wait, cancel_futures)
+
+    def fake_as_completed(_futures, timeout=None):
+        yield finished_future
+        raise TimeoutError("forced timeout")
+
+    class FakeLLM:
+        def is_configured(self):
+            return True
+
+        def chat(self, messages, response_format="json", **kwargs):
+            return {"content": json.dumps({"sql": "SELECT 1", "summary": "ok", "reasoning": "ok"})}
+
+    monkeypatch.setattr(ask_service, "LLMService", FakeLLM)
+    monkeypatch.setattr(ask_service, "ThreadPoolExecutor", FakeExecutor)
+    monkeypatch.setattr(ask_service, "as_completed", fake_as_completed)
+
+    result = ask_service._decompose_merge_sql(
+        question="先看产品，再看城市",
+        project_id=1,
+        analysis={
+            "tier": "compound",
+            "dimensions": [],
+            "metrics": ["Sales"],
+            "entities": [],
+            "sub_questions": ["按产品", "按城市"],
+        },
+        semantic_context="ctx",
+        retrieved_tables=["olist_order_items_dataset"],
+        semantic_hits=_olist_hits(),
+        previous_questions=None,
+        language="zh",
+        knowledge_context=None,
+        resolved=None,
+        schema_link_plan=None,
+        cancel_check=None,
+        failure_meta={},
+        stage_budget_s=30.0,
+    )
+
+    assert result is not None
+    assert pending_future.cancel_called is True
+    assert executor_state["instance"] is not None
+    assert executor_state["instance"].shutdown_args == (False, True)
 
 
 def test_generate_sql_compound_decompose_merge_falls_back_when_groupby_unstable(monkeypatch):
@@ -758,13 +957,13 @@ def test_generate_sql_compound_decompose_merge_falls_back_when_groupby_unstable(
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             user_text = "\n".join(m.get("content", "") for m in messages if m.get("role") == "user")
             if "Sub-question:" in user_text:
                 self.sub_count += 1
                 sql = sub_sql_1 if self.sub_count == 1 else sub_sql_2
                 return {"content": json.dumps({"sql": sql, "summary": "sub", "reasoning": "sub"})}
-            if "Combine these into a single SQL query" in user_text:
+            if "Merge these sub-queries into a single SQL query" in user_text:
                 return {"content": json.dumps({"sql": merged_bad_sql, "summary": "merged", "reasoning": "merged"})}
             return {"content": json.dumps({"sql": direct_sql, "summary": "direct", "reasoning": "direct"})}
 
@@ -793,7 +992,8 @@ def test_generate_sql_compound_decompose_merge_falls_back_when_groupby_unstable(
 
     assert result["sql"] == direct_sql
     assert result["sql_engine"].startswith("direct_llm")
-    assert (ask_service._decompose_merge_state_by_project.get(1) or {}).get("failures", 0) >= 1
+    state = (ask_service._decompose_merge_state_by_project.get(1) or {})
+    assert state.get("disabled_until", 0) > 0, "circuit breaker should have triggered"
     ask_service._decompose_merge_state_by_project.clear()
 
 
@@ -816,14 +1016,7 @@ def test_generate_sql_compound_decompose_merge_falls_back_when_merge_sql_has_par
         "GROUP BY t.product_category_name_english"
     )
     merged_bad_sql = (
-        "SELECT t.product_category_name_english, SUM(oi.price) AS total_sales "
-        "FROM olist_order_items_dataset oi "
-        "JOIN olist_products_dataset p ON oi.product_id = p.product_id "
-        "JOIN product_category_name_translation t ON p.product_category_name = t.product_category_name "
-        "GROUP BY t.product_category_name_english "
-        "ORDER BY total_sales DESC "
-        "UNION ALL "
-        "SELECT t.product_category_name_english, COUNT(DISTINCT oi.order_id) AS total_sales "
+        "SELECT t.product_category_name_english SUM(oi.price) AS total_sales "
         "FROM olist_order_items_dataset oi "
         "JOIN olist_products_dataset p ON oi.product_id = p.product_id "
         "JOIN product_category_name_translation t ON p.product_category_name = t.product_category_name "
@@ -844,13 +1037,13 @@ def test_generate_sql_compound_decompose_merge_falls_back_when_merge_sql_has_par
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             user_text = "\n".join(m.get("content", "") for m in messages if m.get("role") == "user")
             if "Sub-question:" in user_text:
                 self.sub_count += 1
                 sql = sub_sql_1 if self.sub_count == 1 else sub_sql_2
                 return {"content": json.dumps({"sql": sql, "summary": "sub", "reasoning": "sub"})}
-            if "Combine these into a single SQL query" in user_text:
+            if "Merge these sub-queries into a single SQL query" in user_text:
                 return {"content": json.dumps({"sql": merged_bad_sql, "summary": "merged", "reasoning": "merged"})}
             return {"content": json.dumps({"sql": direct_sql, "summary": "direct", "reasoning": "direct"})}
 
@@ -878,5 +1071,6 @@ def test_generate_sql_compound_decompose_merge_falls_back_when_merge_sql_has_par
 
     assert result["sql"] == direct_sql
     assert result["sql_engine"].startswith("direct_llm")
-    assert (ask_service._decompose_merge_state_by_project.get(1) or {}).get("failures", 0) >= 1
+    state = (ask_service._decompose_merge_state_by_project.get(1) or {})
+    assert state.get("disabled_until", 0) > 0, "circuit breaker should have triggered"
     ask_service._decompose_merge_state_by_project.clear()

@@ -9,6 +9,8 @@ import {
   normalizeStrategyTrendHistory,
   normalizeQueryMetricsRows,
   queryMetricsQueryKey,
+  summarizeRoutePathologies,
+  summarizeRouteRepairObservability,
   summarizeStrategyTrend,
   summarizeStrategyObservability,
 } from '@/lib/queryMetrics'
@@ -30,13 +32,20 @@ function buildRouteDimensions(overrides: Partial<QueryRouteDimensions> = {}): Qu
     fallback_count_total: 0,
     fallback_count_avg: 0,
     fallback_count_max: 0,
+    generation_fallback_chain_step: {},
+    generation_fallback_chain_pattern: {},
     repair_used: 0,
     generation_retry_reason: {},
     validation_issue_bucket: {},
+    validation_issue_bucket_transition: {},
     llm_empty_response_retry: 0,
     repair_guard_blocked: 0,
     repair_short_circuit: 0,
     repair_short_circuit_reason: {},
+    repair_short_circuit_issue_bucket: {},
+    repair_short_circuit_dominant_issue_bucket: {},
+    repair_short_circuit_issue_bucket_streak_max: 0,
+    repair_short_circuit_circuitable_issue_bucket_streak_max: 0,
     schema_link_fallback_total: 0,
     schema_link_fallback_reason: {},
     schema_link_fallback_rate: 0,
@@ -46,6 +55,17 @@ function buildRouteDimensions(overrides: Partial<QueryRouteDimensions> = {}): Qu
     final_answer_fallback_total: 0,
     final_answer_fallback_reason: {},
     final_answer_fallback_rate: 0,
+    decompose_stage_total: 0,
+    decompose_stage_status: {},
+    decompose_stage_reason: {},
+    decompose_stage_elapsed_ms_avg: 0,
+    decompose_stage_elapsed_ms_p50: 0,
+    decompose_stage_elapsed_ms_p95: 0,
+    decompose_stage_elapsed_ms_max: 0,
+    decompose_stage_budget_exceeded: 0,
+    duckdb_did_you_mean_fix_total: 0,
+    duckdb_did_you_mean_fix_status: {},
+    duckdb_did_you_mean_fix_applied: 0,
     window_seconds: 1800,
     last_updated: 1,
     ...overrides,
@@ -152,6 +172,117 @@ describe('queryMetrics helpers', () => {
     })
   })
 
+  it('summarizes decompose and did-you-mean repair metrics', () => {
+    const summary = summarizeRouteRepairObservability(buildRouteDimensions({
+      generation_decision_total: 8,
+      generation_retry_reason: { json_reask: 2 },
+      repair_short_circuit: 4,
+      repair_short_circuit_reason: { local_preflight: 2, repair_timeout: 1, repair_budget_low: 1 },
+      decompose_stage_total: 4,
+      decompose_stage_status: { completed: 3, fallback: 1 },
+      decompose_stage_reason: { budget_exceeded: 2, cancelled: 1 },
+      decompose_stage_budget_exceeded: 1,
+      decompose_stage_elapsed_ms_avg: 120.333,
+      decompose_stage_elapsed_ms_p50: 80.1,
+      decompose_stage_elapsed_ms_p95: 250.9,
+      decompose_stage_elapsed_ms_max: 300.2,
+      duckdb_did_you_mean_fix_total: 5,
+      duckdb_did_you_mean_fix_status: { applied: 3, skipped: 2 },
+      duckdb_did_you_mean_fix_applied: 2,
+    }))
+
+    expect(summary).toMatchObject({
+      repairShortCircuitTotal: 4,
+      repairLocalPreflight: 2,
+      repairLocalPreflightRate: 0.5,
+      repairTimeoutShortCircuit: 1,
+      repairTimeoutShortCircuitRate: 0.25,
+      repairBudgetLowShortCircuit: 1,
+      repairBudgetLowShortCircuitRate: 0.25,
+      decomposeStageTotal: 4,
+      decomposeStageBudgetExceeded: 2,
+      decomposeStageBudgetExceededRate: 0.5,
+      decomposeStageCancelled: 1,
+      decomposeStageCancelledRate: 0.25,
+      decomposeStageElapsedMsAvg: 120.33,
+      decomposeStageElapsedMsP50: 80.1,
+      decomposeStageElapsedMsP95: 250.9,
+      decomposeStageElapsedMsMax: 300.2,
+      jsonReaskTotal: 2,
+      jsonReaskRate: 0.25,
+      didYouMeanFixTotal: 5,
+      didYouMeanFixApplied: 3,
+      didYouMeanFixAppliedRate: 0.6,
+    })
+    expect(summary.didYouMeanStatuses[0]).toEqual(['applied', 3])
+  })
+
+  it('falls back to avg/max latency and status counters when percentile fields are missing', () => {
+    const summary = summarizeRouteRepairObservability(buildRouteDimensions({
+      decompose_stage_total: 2,
+      decompose_stage_status: { fallback: 2 },
+      decompose_stage_elapsed_ms_avg: 45,
+      decompose_stage_elapsed_ms_p50: 0,
+      decompose_stage_elapsed_ms_p95: 0,
+      decompose_stage_elapsed_ms_max: 90,
+      duckdb_did_you_mean_fix_total: 0,
+      duckdb_did_you_mean_fix_status: { applied: 1, skipped: 1 },
+      duckdb_did_you_mean_fix_applied: 0,
+    }))
+
+    expect(summary.decomposeStageElapsedMsP50).toBe(45)
+    expect(summary.decomposeStageElapsedMsP95).toBe(90)
+    expect(summary.repairShortCircuitTotal).toBe(0)
+    expect(summary.repairLocalPreflight).toBe(0)
+    expect(summary.repairLocalPreflightRate).toBe(0)
+    expect(summary.repairTimeoutShortCircuit).toBe(0)
+    expect(summary.repairTimeoutShortCircuitRate).toBe(0)
+    expect(summary.repairBudgetLowShortCircuit).toBe(0)
+    expect(summary.repairBudgetLowShortCircuitRate).toBe(0)
+    expect(summary.decomposeStageCancelled).toBe(0)
+    expect(summary.decomposeStageCancelledRate).toBe(0)
+    expect(summary.jsonReaskTotal).toBe(0)
+    expect(summary.jsonReaskRate).toBe(0)
+    expect(summary.didYouMeanFixTotal).toBe(2)
+    expect(summary.didYouMeanFixApplied).toBe(1)
+    expect(summary.didYouMeanFixAppliedRate).toBe(0.5)
+  })
+
+  it('summarizes route pathologies for fallback chains and issue transitions', () => {
+    const summary = summarizeRoutePathologies(buildRouteDimensions({
+      generation_fallback_chain_step: {
+        repair: 4,
+        execution_repair: 2,
+        json_reask: 3,
+      },
+      generation_fallback_chain_pattern: {
+        'json_reask>repair>execution_repair': 2,
+        'repair>execution_repair': 3,
+      },
+      validation_issue_bucket_transition: {
+        'duplicate_alias->wrong_alias_owner': 2,
+        'wrong_alias_owner->ambiguous_owner': 1,
+      },
+      repair_short_circuit_issue_bucket: {
+        wrong_alias_owner: 3,
+        ambiguous_owner: 1,
+      },
+      repair_short_circuit_dominant_issue_bucket: {
+        ambiguous_owner: 2,
+      },
+      repair_short_circuit_issue_bucket_streak_max: 3,
+      repair_short_circuit_circuitable_issue_bucket_streak_max: 4,
+    }))
+
+    expect(summary.fallbackChainSteps[0]).toEqual(['repair', 4])
+    expect(summary.fallbackChainPatterns[0]).toEqual(['repair>execution_repair', 3])
+    expect(summary.validationIssueTransitions[0]).toEqual(['duplicate_alias->wrong_alias_owner', 2])
+    expect(summary.repairShortCircuitIssueBuckets[0]).toEqual(['wrong_alias_owner', 3])
+    expect(summary.repairShortCircuitDominantIssueBuckets[0]).toEqual(['ambiguous_owner', 2])
+    expect(summary.repairIssueBucketStreakMax).toBe(3)
+    expect(summary.repairCircuitableIssueBucketStreakMax).toBe(4)
+  })
+
   it('returns no route alerts when counters are below thresholds', () => {
     const alerts = evaluateRouteObservabilityAlerts(buildRouteDimensions({
       events_total: 10,
@@ -208,6 +339,64 @@ describe('queryMetrics helpers', () => {
     ])
   })
 
+  it('raises warning when repair timeout and budget-low short-circuit rates are elevated', () => {
+    const alerts = evaluateRouteObservabilityAlerts(buildRouteDimensions({
+      events_total: 20,
+      repair_short_circuit: 8,
+      repair_short_circuit_reason: {
+        local_preflight: 4,
+        repair_timeout: 2,
+        repair_budget_low: 2,
+      },
+    }))
+
+    expect(alerts).toEqual([
+      { id: 'repair_budget_low_short_circuit_high', level: 'warning', count: 2, threshold: 2 },
+      { id: 'repair_timeout_short_circuit_high', level: 'warning', count: 2, threshold: 2 },
+    ])
+  })
+
+  it('raises critical when repair timeout and budget-low short-circuit rates are severe', () => {
+    const alerts = evaluateRouteObservabilityAlerts(buildRouteDimensions({
+      events_total: 24,
+      repair_short_circuit: 12,
+      repair_short_circuit_reason: {
+        local_preflight: 1,
+        repair_timeout: 6,
+        repair_budget_low: 5,
+      },
+    }))
+
+    expect(alerts).toEqual([
+      { id: 'repair_timeout_short_circuit_high', level: 'critical', count: 6, threshold: 6 },
+      { id: 'repair_budget_low_short_circuit_high', level: 'critical', count: 5, threshold: 5 },
+    ])
+  })
+
+  it('uses configurable thresholds for repair timeout and budget-low short-circuit alerts', () => {
+    const alerts = evaluateRouteObservabilityAlerts(buildRouteDimensions({
+      events_total: 16,
+      repair_short_circuit: 10,
+      repair_short_circuit_reason: {
+        local_preflight: 6,
+        repair_timeout: 2,
+        repair_budget_low: 2,
+      },
+      route_alert_repair_timeout_short_circuit_warning_rate: 0.3,
+      route_alert_repair_timeout_short_circuit_critical_rate: 0.5,
+      route_alert_repair_timeout_short_circuit_min_warning_events: 8,
+      route_alert_repair_timeout_short_circuit_min_critical_events: 12,
+      route_alert_repair_budget_low_short_circuit_warning_rate: 0.15,
+      route_alert_repair_budget_low_short_circuit_critical_rate: 0.4,
+      route_alert_repair_budget_low_short_circuit_min_warning_events: 8,
+      route_alert_repair_budget_low_short_circuit_min_critical_events: 12,
+    }))
+
+    expect(alerts).toEqual([
+      { id: 'repair_budget_low_short_circuit_high', level: 'warning', count: 2, threshold: 2 },
+    ])
+  })
+
   it('raises fallback-rate warnings when decision volume is sufficient', () => {
     const alerts = evaluateRouteObservabilityAlerts(buildRouteDimensions({
       generation_decision_total: 20,
@@ -247,6 +436,56 @@ describe('queryMetrics helpers', () => {
     }))
 
     expect(alerts).toEqual([])
+  })
+
+  it('raises warning alerts for elevated json re-ask and decompose cancellation rates', () => {
+    const alerts = evaluateRouteObservabilityAlerts(buildRouteDimensions({
+      generation_decision_total: 20,
+      generation_retry_reason: { json_reask: 4 },
+      decompose_stage_total: 8,
+      decompose_stage_reason: { cancelled: 2 },
+    }))
+
+    expect(alerts).toEqual([
+      { id: 'json_reask_high', level: 'warning', count: 4, threshold: 4 },
+      { id: 'decompose_cancelled_high', level: 'warning', count: 2, threshold: 2 },
+    ])
+  })
+
+  it('raises critical alerts for severe json re-ask and decompose cancellation rates', () => {
+    const alerts = evaluateRouteObservabilityAlerts(buildRouteDimensions({
+      generation_decision_total: 20,
+      generation_retry_reason: { json_reask: 8 },
+      decompose_stage_total: 12,
+      decompose_stage_reason: { cancelled: 4 },
+    }))
+
+    expect(alerts).toEqual([
+      { id: 'json_reask_high', level: 'critical', count: 8, threshold: 8 },
+      { id: 'decompose_cancelled_high', level: 'critical', count: 4, threshold: 4 },
+    ])
+  })
+
+  it('uses configurable thresholds for json re-ask and decompose cancellation alerts', () => {
+    const alerts = evaluateRouteObservabilityAlerts(buildRouteDimensions({
+      generation_decision_total: 16,
+      generation_retry_reason: { json_reask: 4 },
+      decompose_stage_total: 16,
+      decompose_stage_reason: { cancelled: 4 },
+      route_alert_json_reask_warning_rate: 0.25,
+      route_alert_json_reask_critical_rate: 0.2,
+      route_alert_json_reask_min_warning_decisions: 8,
+      route_alert_json_reask_min_critical_decisions: 4,
+      route_alert_decompose_cancelled_warning_rate: 0.2,
+      route_alert_decompose_cancelled_critical_rate: 0.1,
+      route_alert_decompose_cancelled_min_warning_events: 8,
+      route_alert_decompose_cancelled_min_critical_events: 6,
+    }))
+
+    expect(alerts).toEqual([
+      { id: 'decompose_cancelled_high', level: 'warning', count: 4, threshold: 4 },
+      { id: 'json_reask_high', level: 'warning', count: 4, threshold: 4 },
+    ])
   })
 
   it('derives fallback alert counts from rates when totals are missing', () => {

@@ -462,7 +462,7 @@ def _init_db_unlocked() -> duckdb.DuckDBPyConnection:
             id VARCHAR PRIMARY KEY,
             project_id INTEGER,
             api_type VARCHAR NOT NULL,
-            thread_id INTEGER REFERENCES metadata.threads(id),
+            thread_id BIGINT,
             headers JSON,
             request_payload JSON,
             response_payload JSON,
@@ -477,6 +477,27 @@ def _init_db_unlocked() -> duckdb.DuckDBPyConnection:
             key VARCHAR PRIMARY KEY,
             value JSON NOT NULL,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS metadata.llm_capabilities (
+            provider VARCHAR NOT NULL,
+            endpoint VARCHAR NOT NULL,
+            model VARCHAR NOT NULL,
+            model_family VARCHAR,
+            model_tier VARCHAR,
+            structured_output JSON,
+            sql_quality JSON,
+            instruction JSON,
+            repair JSON,
+            performance JSON,
+            probe_level VARCHAR DEFAULT 'keyword_only',
+            probe_count INTEGER DEFAULT 0,
+            probed_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (provider, endpoint, model)
         )
     """)
 
@@ -756,6 +777,44 @@ def _migrate_schema(con: duckdb.DuckDBPyConnection) -> None:
             con.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {dtype}")
         except Exception as exc:
             LOGGER.warning("Migration skip: %s", exc)
+
+    # Migrate api_history.thread_id from INTEGER to BIGINT
+    try:
+        import duckdb
+        col_info = con.execute(
+            "SELECT data_type FROM information_schema.columns "
+            "WHERE table_schema = 'metadata' AND table_name = 'api_history' AND column_name = 'thread_id'"
+        ).fetchone()
+        if col_info and col_info[0] == "INTEGER":
+            con.execute("""
+                CREATE TABLE metadata.__migration_api_history_bigint (
+                    id VARCHAR PRIMARY KEY,
+                    project_id INTEGER,
+                    api_type VARCHAR NOT NULL,
+                    thread_id BIGINT,
+                    headers JSON,
+                    request_payload JSON,
+                    response_payload JSON,
+                    status_code INTEGER,
+                    duration_ms INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            con.execute("""
+                INSERT INTO metadata.__migration_api_history_bigint
+                    (id, project_id, api_type, thread_id, headers, request_payload,
+                     response_payload, status_code, duration_ms, created_at)
+                SELECT id, project_id, api_type, CAST(thread_id AS BIGINT), headers,
+                       request_payload, response_payload, status_code, duration_ms, created_at
+                FROM metadata.api_history
+            """)
+            con.execute("DROP TABLE metadata.api_history")
+            con.execute("ALTER TABLE metadata.__migration_api_history_bigint RENAME TO api_history")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_api_history_thread_id ON metadata.api_history(thread_id)")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_api_history_project_id ON metadata.api_history(project_id)")
+            LOGGER.info("Migrated metadata.api_history.thread_id from INTEGER to BIGINT")
+    except (ValueError, duckdb.Error) as exc:
+        LOGGER.warning("Migration skip (api_history.thread_id): %s", exc)
 
 
 def _metadata_column_exists(

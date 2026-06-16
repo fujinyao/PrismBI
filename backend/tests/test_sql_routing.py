@@ -70,7 +70,7 @@ def test_prompt_profile_router_selects_json_schema_for_structured_stage():
     assert sql_generation.response_format.get("type") == "json_schema"
 
     assert final_answer.response_format is None
-    assert "Prompt profile prismbi.default/v2" in final_answer.system_suffix
+    assert "[profile prismbi.default/v2]" in final_answer.system_suffix
 
 
 def test_generation_router_decisions_by_tier():
@@ -237,6 +237,52 @@ def test_generation_pipeline_prepare_context_builds_prepared_state():
     assert prepared.max_retries == 1
     assert isinstance(prepared.response_format, dict)
     assert prepared.response_format.get("type") == "json_schema"
+
+
+def test_generation_pipeline_prepare_context_passes_model_tier_to_profile_selection():
+    profile_router = PromptProfileRouter(default_profile_version="v2")
+    semantic_hits = {
+        "has_hits": True,
+        "models": [{"name": "orders", "columns": [{"name": "order_id"}], "matched_columns": []}],
+        "relations": [],
+    }
+    captured: dict[str, str | None] = {"model_tier": None}
+
+    def _profile_selection(stage, strict_json_mode, model_tier=None):
+        captured["model_tier"] = model_tier
+        return profile_router.select(stage, strict_json_mode=strict_json_mode, model_tier=model_tier)
+
+    pipeline = GenerationPipeline(
+        normalize_question_analysis=lambda analysis: analysis or {"tier": "simple"},
+        semantic_prompt=lambda *_args, **_kwargs: ("schema context", ["orders"], semantic_hits),
+        resolve_analysis_to_schema=lambda _analysis, _models: {},
+        prune_schema=lambda models, relations, *_args, **_kwargs: (models, relations),
+        reformat_schema_context=lambda *_args, **_kwargs: "schema context",
+        build_schema_linking_plan=lambda *_args, **_kwargs: {},
+        build_sql_planning_artifact=lambda *_args, **_kwargs: {},
+        select_sql_strategy=lambda _analysis, _has_knowledge: {"engine": "direct_llm", "max_retries": 1, "use_examples": False},
+        estimate_sql_generation_complexity=lambda _analysis, _semantic_hits: 2,
+        strict_json_capability=lambda: {"supported": True, "mode": "json_schema"},
+        prompt_profile_selection=_profile_selection,
+        is_sql_route_v2_enabled=lambda _project_id: True,
+        resolve_model_tier=lambda: "weak",
+    )
+
+    prepared, early = pipeline.prepare_context(
+        question="sales",
+        project_id=1,
+        semantic_context=None,
+        retrieved_tables=None,
+        semantic_hits=None,
+        knowledge_context=None,
+        analysis={"tier": "simple"},
+        router_config={"sql_route_shadow_mode": False, "schema_pruning_enabled": False, "tier1_max_retries": 2},
+    )
+
+    assert early is None
+    assert prepared is not None
+    assert captured["model_tier"] == "weak"
+    assert "CRITICAL - Output ONLY valid JSON" in prepared.system_suffix
 
 
 def test_generation_pipeline_shadow_diff_detects_engine_change():

@@ -81,6 +81,18 @@ async def lifespan(app: FastAPI):
     except Exception:
         LOGGER.warning("Failed to refresh ask/router runtime settings during startup", exc_info=True)
     try:
+        from services.sql_routing.llm_capability import get_model_capabilities
+        from services.llm_service import get_llm_config
+        cfg = get_llm_config()
+        get_model_capabilities(
+            cfg.get("provider", ""),
+            cfg.get("endpoint", ""),
+            cfg.get("model", ""),
+        )
+        LOGGER.info("Startup probe triggered for %s/%s", cfg.get("provider"), cfg.get("model"))
+    except Exception:
+        LOGGER.debug("Startup LLM probe not available (LLM may not be configured yet)", exc_info=True)
+    try:
         yield
     finally:
         close_connection()
@@ -137,6 +149,8 @@ async def api_history_middleware(request: Request, call_next):
                 normalized_project_id = int(project_id) if project_id is not None else None
                 if normalized_project_id is not None and normalized_project_id <= 0:
                     normalized_project_id = None
+                raw_thread_id = request_body.get("thread_id") if isinstance(request_body, dict) else None
+                safe_thread_id = raw_thread_id if isinstance(raw_thread_id, int) and -2147483648 <= raw_thread_id <= 2147483647 else None
                 con.execute(
                     "INSERT INTO metadata.api_history (id, project_id, api_type, thread_id, headers, request_payload, response_payload, status_code, duration_ms) "
                     "VALUES (?, ?, ?, ?, ?::JSON, ?::JSON, ?::JSON, ?, ?)",
@@ -144,7 +158,7 @@ async def api_history_middleware(request: Request, call_next):
                         str(uuid.uuid4()),
                         normalized_project_id,
                         request.method,
-                        request_body.get("thread_id") if isinstance(request_body, dict) else None,
+                        safe_thread_id,
                         json.dumps({"path": request.url.path, "query": _redact_query_string(str(request.url.query)), "user_agent": request.headers.get("user-agent")}),
                         json.dumps(request_body),
                         json.dumps({"status": response.status_code}),

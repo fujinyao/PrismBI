@@ -19,31 +19,63 @@ def _anthropic_config() -> dict[str, object]:
     }
 
 
-def test_anthropic_chat_rejects_structured_response_format_schema(monkeypatch):
-    service = LLMService(config=_anthropic_config())
+def test_anthropic_chat_downgrades_dict_response_format(monkeypatch):
+    import services.llm_service as llm_service_mod
+    llm_service_mod._LLM_RESPONSE_CACHE.clear()
+    from services.llm.adapters.anthropic import AnthropicAdapter
 
-    monkeypatch.setattr(
-        service,
-        "_anthropic_chat",
-        lambda _messages, response_format=None: ("{}", {"response_format": response_format}),
+    class FakeAnthropicAdapter(AnthropicAdapter):
+        def __init__(self):
+            self.received_rf = None
+
+        def chat(self, messages, response_format=None, **kwargs):
+            self.received_rf = response_format
+            return ("{\"ok\": true}", {"ok": True})
+
+    llm_caps = {
+        "sql_quality": {"sql_accuracy_tier": "high", "sql_safety_compliant": False},
+        "structured_output": {"supports_json_schema": False, "supports_json_object": True},
+        "repair": {"repair_capability": False},
+    }
+
+    service = LLMService(config=_anthropic_config())
+    adapter = FakeAnthropicAdapter()
+    monkeypatch.setattr(service, "_get_adapter", lambda: adapter)
+    monkeypatch.setattr(service, "_get_capabilities", lambda: llm_caps)
+
+    result = service.chat(
+        [{"role": "user", "content": "hello"}],
+        response_format={"type": "json_schema"},
     )
 
-    with pytest.raises(ValueError, match="response_format"):
-        service.chat(
-            [{"role": "user", "content": "hello"}],
-            response_format={"type": "json_schema"},
-        )
+    assert result["configured"] is True
+    assert adapter.received_rf == "json"
 
 
-def test_anthropic_chat_accepts_json_mode(monkeypatch):
+def test_anthropic_chat_passes_through_json_mode(monkeypatch):
+    from services.llm.adapters.anthropic import AnthropicAdapter
+    import services.llm_service as llm_service_mod
+
+    llm_service_mod._LLM_RESPONSE_CACHE.clear()
+
+    class FakeAnthropicAdapter(AnthropicAdapter):
+        def __init__(self):
+            self.received_rf = None
+
+        def chat(self, messages, response_format=None, **kwargs):
+            self.received_rf = response_format
+            return ("{\"ok\": true}", {"ok": True})
+
+    llm_caps = {
+        "sql_quality": {"sql_accuracy_tier": "high", "sql_safety_compliant": False},
+        "structured_output": {"supports_json_schema": True, "supports_json_object": True},
+        "repair": {"repair_capability": False},
+    }
+
     service = LLMService(config=_anthropic_config())
-    captured: dict[str, object] = {"response_format": None}
-
-    def _fake_anthropic(_messages, response_format=None):
-        captured["response_format"] = response_format
-        return "{\"ok\":true}", {"ok": True}
-
-    monkeypatch.setattr(service, "_anthropic_chat", _fake_anthropic)
+    adapter = FakeAnthropicAdapter()
+    monkeypatch.setattr(service, "_get_adapter", lambda: adapter)
+    monkeypatch.setattr(service, "_get_capabilities", lambda: llm_caps)
 
     result = service.chat(
         [{"role": "user", "content": "hello"}],
@@ -51,7 +83,7 @@ def test_anthropic_chat_accepts_json_mode(monkeypatch):
     )
 
     assert result["configured"] is True
-    assert captured["response_format"] == "json"
+    assert adapter.received_rf == "json"
 
 
 class _StatusCodeClient:
@@ -157,3 +189,202 @@ def test_llm_http_circuit_snapshot_reports_open_and_closed_keys(monkeypatch):
     assert snapshot["keys"]["closed-key"]["state"] == "closed"
     assert snapshot["keys"]["closed-key"]["consecutive_failures"] == 2
     llm_service.clear_llm_http_circuit_state()
+
+
+def test_normalize_retry_policy_overrides_max_retries_without_losing_other_settings(monkeypatch):
+    monkeypatch.setattr(
+        llm_service,
+        "_load_llm_http_resilience_settings",
+        lambda force_refresh=False: {
+            "max_retries": 3,
+            "retry_base_delay_s": 0.25,
+            "retry_max_delay_s": 1.5,
+            "circuit_enabled": True,
+            "circuit_failure_threshold": 4,
+            "circuit_open_seconds": 22.0,
+        },
+    )
+
+    policy = llm_service._normalize_retry_policy({"max_retries": 1})
+
+    assert policy["max_retries"] == 1
+    assert policy["retry_base_delay_s"] == 0.25
+    assert policy["retry_max_delay_s"] == 1.5
+    assert policy["circuit_enabled"] is True
+    assert policy["circuit_failure_threshold"] == 4
+    assert policy["circuit_open_seconds"] == 22.0
+
+
+def test_llm_service_chat_passes_retry_policy_to_adapter(monkeypatch):
+    class FakeAdapter:
+        def __init__(self):
+            self.received_retry_policy = None
+
+        def chat(self, messages, response_format=None, params=None, timeout=None, config=None, retry_policy=None):
+            self.received_retry_policy = retry_policy
+            return "ok", {"ok": True}
+
+    adapter = FakeAdapter()
+    service = LLMService(config={
+        "provider": "openai",
+        "api_key": "test-key",
+        "model": "gpt-4o-mini",
+        "endpoint": "https://api.openai.com/v1",
+        "max_tokens": 128,
+        "temperature": 0,
+        "extra_params": {},
+        "_probe_mode": True,
+    })
+    monkeypatch.setattr(service, "_get_adapter", lambda: adapter)
+
+    result = service.chat(
+        [{"role": "user", "content": "hello"}],
+        retry_policy={"max_retries": 1},
+    )
+
+    assert result["configured"] is True
+    assert adapter.received_retry_policy == {"max_retries": 1}
+
+
+def test_llm_service_adapt_params_preserves_user_overrides(monkeypatch):
+    class FakeAdapter:
+        def __init__(self):
+            self.received_config = None
+
+        def adapt_response_format(self, requested, tier, capabilities):
+            return requested
+
+        def get_default_params(self, tier):
+            return {
+                "temperature": 0.9,
+                "max_tokens": 1024,
+                "extra_params": {"frequency_penalty": 0.1},
+                "seed": 11,
+            }
+
+        def chat(self, messages, response_format=None, params=None, timeout=None, config=None, retry_policy=None):
+            self.received_config = dict(config or {})
+            return "ok", {"ok": True}
+
+    adapter = FakeAdapter()
+    service = LLMService(config={
+        "provider": "openai",
+        "api_key": "test-key",
+        "model": "gpt-4o-mini",
+        "endpoint": "https://api.openai.com/v1",
+        "max_tokens": 512,
+        "temperature": 0.6,
+        "extra_params": {
+            "top_p": 0.2,
+            "frequency_penalty": 0.4,
+        },
+    })
+    monkeypatch.setattr(
+        service,
+        "_get_capabilities",
+        lambda: {
+            "sql_quality": {"sql_accuracy_tier": "low", "sql_safety_compliant": False},
+            "structured_output": {"supports_json_object": False, "json_mode_reliable": False},
+            "repair": {"repair_capability": False},
+        },
+    )
+    monkeypatch.setattr(service, "_get_adapter", lambda: adapter)
+
+    result = service.chat([{"role": "user", "content": "hello"}], response_format="json")
+
+    assert result["configured"] is True
+    assert adapter.received_config is not None
+    assert adapter.received_config["temperature"] == 0.6
+    assert adapter.received_config["max_tokens"] == 512
+    assert adapter.received_config["extra_params"]["top_p"] == 0.2
+    assert adapter.received_config["extra_params"]["frequency_penalty"] == 0.4
+    assert adapter.received_config["extra_params"]["seed"] == 11
+    assert "repeat_penalty" not in adapter.received_config["extra_params"]
+
+
+def test_llm_service_adapt_params_applies_adapter_defaults_when_user_unset(monkeypatch):
+    class FakeAdapter:
+        def __init__(self):
+            self.received_config = None
+
+        def adapt_response_format(self, requested, tier, capabilities):
+            return requested
+
+        def get_default_params(self, tier):
+            return {
+                "temperature": 0.45,
+                "max_tokens": 2048,
+                "repeat_penalty": 1.05,
+                "extra_params": {"seed": 7},
+            }
+
+        def chat(self, messages, response_format=None, params=None, timeout=None, config=None, retry_policy=None):
+            self.received_config = dict(config or {})
+            return "ok", {"ok": True}
+
+    adapter = FakeAdapter()
+    service = LLMService(config={
+        "provider": "openai",
+        "api_key": "test-key",
+        "model": "gpt-4o-mini",
+        "endpoint": "https://api.openai.com/v1",
+        "max_tokens": None,
+        "temperature": None,
+        "extra_params": {"top_k": 25},
+    })
+    monkeypatch.setattr(
+        service,
+        "_get_capabilities",
+        lambda: {
+            "sql_quality": {"sql_accuracy_tier": "medium", "sql_safety_compliant": False},
+            "structured_output": {"supports_json_object": True, "json_mode_reliable": True},
+            "repair": {"repair_capability": False},
+        },
+    )
+    monkeypatch.setattr(service, "_get_adapter", lambda: adapter)
+
+    result = service.chat([{"role": "user", "content": "hello"}], response_format="json")
+
+    assert result["configured"] is True
+    assert adapter.received_config is not None
+    assert adapter.received_config["temperature"] == 0.45
+    assert adapter.received_config["max_tokens"] == 2048
+    assert adapter.received_config["extra_params"]["seed"] == 7
+    assert adapter.received_config["extra_params"]["repeat_penalty"] == 1.05
+    assert adapter.received_config["extra_params"]["top_k"] == 25
+
+
+def test_llm_service_cache_returns_copy_to_prevent_caller_mutation(monkeypatch):
+    class FakeAdapter:
+        def __init__(self):
+            self.calls = 0
+
+        def chat(self, messages, response_format=None, params=None, timeout=None, config=None, retry_policy=None):
+            self.calls += 1
+            return "original", {"call": self.calls}
+
+    adapter = FakeAdapter()
+    service = LLMService(config={
+        "provider": "openai",
+        "api_key": "test-key",
+        "model": "gpt-4o-mini",
+        "endpoint": "https://api.openai.com/v1",
+        "max_tokens": 128,
+        "temperature": 0.1,
+        "extra_params": {},
+        "_probe_mode": True,
+    })
+    monkeypatch.setattr(service, "_get_adapter", lambda: adapter)
+
+    messages = [{"role": "user", "content": "hello"}]
+    first = service.chat(messages, response_format="json")
+    first["content"] = "mutated"
+    if isinstance(first.get("raw"), dict):
+        first["raw"]["call"] = 999
+
+    second = service.chat(messages, response_format="json")
+
+    assert adapter.calls == 1
+    assert second["content"] == "original"
+    assert isinstance(second.get("raw"), dict)
+    assert second["raw"]["call"] == 1

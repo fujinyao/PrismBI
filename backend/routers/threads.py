@@ -12,7 +12,7 @@ from services.ask_service import (
     ask_question as run_ask_question,
     get_thread_project_id,
     list_thread_responses,
-    normalize_preview_row_limit as normalize_preview_row_limit_runtime,
+    _normalize_preview_row_limit as normalize_preview_row_limit_runtime,
 )
 
 LOGGER = logging.getLogger(__name__)

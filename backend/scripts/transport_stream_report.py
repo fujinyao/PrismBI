@@ -9,6 +9,9 @@ from typing import Any
 
 
 _FRAME_BYTES_RE = re.compile(r"\[(?P<bytes>\d+)\s+bytes\]")
+_REQUEST_ID_RE = re.compile(r'"request_id"\s*:\s*"(?P<request_id>[^"\\]+)"')
+_SEQ_RE = re.compile(r'"seq"\s*:\s*(?P<seq>\d+)')
+_ELAPSED_MS_RE = re.compile(r'"elapsed_ms"\s*:\s*(?P<elapsed_ms>\d+)')
 
 
 def _extract_frame_bytes(line: str) -> int:
@@ -25,6 +28,24 @@ def _safe_ratio(numerator: int, denominator: int) -> float:
     if denominator <= 0:
         return 0.0
     return round(float(numerator) / float(denominator), 4)
+
+
+def _extract_json_int(line: str, regex: re.Pattern[str], group_name: str) -> int | None:
+    match = regex.search(line)
+    if not match:
+        return None
+    try:
+        return int(match.group(group_name))
+    except Exception:
+        return None
+
+
+def _extract_request_id(line: str) -> str | None:
+    match = _REQUEST_ID_RE.search(line)
+    if not match:
+        return None
+    request_id = str(match.group("request_id") or "").strip()
+    return request_id or None
 
 
 def analyze_transport_stream_log(text: str) -> dict[str, Any]:
@@ -58,6 +79,18 @@ def analyze_transport_stream_log(text: str) -> dict[str, Any]:
         "app_ping_frames": 0,
         "app_pong_frames": 0,
     }
+    timing = {
+        "frames_with_seq": 0,
+        "frames_with_elapsed_ms": 0,
+        "requests_with_meta": 0,
+        "seq_non_monotonic_count": 0,
+        "elapsed_non_monotonic_count": 0,
+        "avg_first_delta_elapsed_ms": 0.0,
+        "avg_result_elapsed_ms": 0.0,
+        "max_result_elapsed_ms": 0,
+        "min_result_elapsed_ms": 0,
+    }
+    per_request_timing: dict[str, dict[str, int | None]] = {}
 
     for raw_line in str(text or "").splitlines():
         line = raw_line.strip()
@@ -131,6 +164,49 @@ def analyze_transport_stream_log(text: str) -> dict[str, Any]:
         if is_inbound_text and '"type":"ask"' in line:
             frames["ask_frames"] = int(frames["ask_frames"] or 0) + 1
 
+        if is_outbound_text and (
+            '"type":"delta"' in line
+            or '"type":"result"' in line
+            or '"type":"error"' in line
+        ):
+            request_id = _extract_request_id(line)
+            seq_value = _extract_json_int(line, _SEQ_RE, "seq")
+            elapsed_ms_value = _extract_json_int(line, _ELAPSED_MS_RE, "elapsed_ms")
+
+            if seq_value is not None:
+                timing["frames_with_seq"] = int(timing["frames_with_seq"] or 0) + 1
+            if elapsed_ms_value is not None:
+                timing["frames_with_elapsed_ms"] = int(timing["frames_with_elapsed_ms"] or 0) + 1
+
+            if not request_id:
+                continue
+
+            state = per_request_timing.setdefault(
+                request_id,
+                {
+                    "last_seq": None,
+                    "last_elapsed_ms": None,
+                    "first_delta_elapsed_ms": None,
+                    "result_elapsed_ms": None,
+                },
+            )
+
+            last_seq = state.get("last_seq")
+            if seq_value is not None:
+                if isinstance(last_seq, int) and seq_value <= last_seq:
+                    timing["seq_non_monotonic_count"] = int(timing["seq_non_monotonic_count"] or 0) + 1
+                state["last_seq"] = seq_value
+
+            last_elapsed = state.get("last_elapsed_ms")
+            if elapsed_ms_value is not None:
+                if isinstance(last_elapsed, int) and elapsed_ms_value < last_elapsed:
+                    timing["elapsed_non_monotonic_count"] = int(timing["elapsed_non_monotonic_count"] or 0) + 1
+                state["last_elapsed_ms"] = elapsed_ms_value
+                if state.get("first_delta_elapsed_ms") is None and '"type":"delta"' in line:
+                    state["first_delta_elapsed_ms"] = elapsed_ms_value
+                if '"type":"result"' in line:
+                    state["result_elapsed_ms"] = elapsed_ms_value
+
     outbound_count = int(frames.get("outbound_text_frames") or 0)
     inbound_count = int(frames.get("inbound_text_frames") or 0)
     ws_debug_count = int(line_totals.get("websocket_debug_lines") or 0)
@@ -169,11 +245,36 @@ def analyze_transport_stream_log(text: str) -> dict[str, Any]:
         ),
     }
 
+    timing["requests_with_meta"] = len(per_request_timing)
+    first_delta_samples: list[int] = []
+    result_samples: list[int] = []
+    for state in per_request_timing.values():
+        first_delta_elapsed = state.get("first_delta_elapsed_ms")
+        result_elapsed = state.get("result_elapsed_ms")
+        if isinstance(first_delta_elapsed, int):
+            first_delta_samples.append(first_delta_elapsed)
+        if isinstance(result_elapsed, int):
+            result_samples.append(result_elapsed)
+
+    if first_delta_samples:
+        timing["avg_first_delta_elapsed_ms"] = round(
+            float(sum(first_delta_samples)) / float(len(first_delta_samples)),
+            2,
+        )
+    if result_samples:
+        timing["avg_result_elapsed_ms"] = round(
+            float(sum(result_samples)) / float(len(result_samples)),
+            2,
+        )
+        timing["max_result_elapsed_ms"] = max(result_samples)
+        timing["min_result_elapsed_ms"] = min(result_samples)
+
     return {
         "line_totals": line_totals,
         "frames": frames,
         "ping_pong": ping_pong,
         "noise": noise,
+        "timing": timing,
     }
 
 
@@ -182,6 +283,7 @@ def _render_human_report(report: dict[str, Any]) -> str:
     frames = report.get("frames") or {}
     ping_pong = report.get("ping_pong") or {}
     noise = report.get("noise") or {}
+    timing = report.get("timing") or {}
 
     lines: list[str] = []
     lines.append("Transport/Stream Report")
@@ -219,6 +321,17 @@ def _render_human_report(report: dict[str, Any]) -> str:
         "noise: "
         f"frame_noise_share={noise.get('frame_noise_share', 0.0):.4f} "
         f"delta_text_share_of_outbound={noise.get('text_delta_share_of_outbound_text', 0.0):.4f}"
+    )
+    lines.append(
+        "timing: "
+        f"requests_with_meta={timing.get('requests_with_meta', 0)} "
+        f"frames_with_seq={timing.get('frames_with_seq', 0)} "
+        f"frames_with_elapsed_ms={timing.get('frames_with_elapsed_ms', 0)} "
+        f"avg_first_delta_elapsed_ms={timing.get('avg_first_delta_elapsed_ms', 0.0)} "
+        f"avg_result_elapsed_ms={timing.get('avg_result_elapsed_ms', 0.0)} "
+        f"result_elapsed_range=[{timing.get('min_result_elapsed_ms', 0)},{timing.get('max_result_elapsed_ms', 0)}] "
+        f"seq_non_monotonic={timing.get('seq_non_monotonic_count', 0)} "
+        f"elapsed_non_monotonic={timing.get('elapsed_non_monotonic_count', 0)}"
     )
     return "\n".join(lines)
 

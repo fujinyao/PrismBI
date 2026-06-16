@@ -1,17 +1,24 @@
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import logging
 import os
+import random
 import threading
 import time
-from typing import Any, Optional
+from collections import OrderedDict
+from typing import TYPE_CHECKING, Any, Optional
 
 import httpx
 
 from db import get_connection, connection_lock
 from services.crypto_service import decrypt_json, is_encrypted_value
 from services.prompt_templates import DEFAULT_SYSTEM_PROMPT
+
+if TYPE_CHECKING:
+    from services.llm.adapters.base import LLMProviderAdapter
 
 LOGGER = logging.getLogger(__name__)
 
@@ -44,6 +51,55 @@ _LLM_HTTP_POLICY_CACHE = {
     "policy": None,
 }
 _LLM_HTTP_POLICY_CACHE_TTL_SECONDS = 5.0
+
+# LLM response LRU cache: identical prompts return cached result
+# Capacity 8 entries, TTL 60s — reduces redundant calls for retries, repair, and decompose-merge
+_LLM_RESPONSE_CACHE: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
+_LLM_RESPONSE_CACHE_MAX_SIZE = 8
+_LLM_RESPONSE_CACHE_TTL_SECONDS = 60.0
+_LLM_RESPONSE_CACHE_LOCK = threading.Lock()
+
+
+def _llm_cache_key(config: dict[str, Any], messages: list[dict[str, Any]], response_format: Any) -> str:
+    raw = json.dumps(
+        {
+            "provider": config.get("provider"),
+            "endpoint": config.get("endpoint"),
+            "model": config.get("model"),
+            "temperature": config.get("temperature"),
+            "max_tokens": config.get("max_tokens"),
+            "extra_params": config.get("extra_params"),
+            "messages": messages,
+            "response_format": response_format,
+        },
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _llm_cache_get(key: str) -> dict[str, Any] | None:
+    now = time.monotonic()
+    with _LLM_RESPONSE_CACHE_LOCK:
+        entry = _LLM_RESPONSE_CACHE.get(key)
+        if entry is None:
+            return None
+        ts, result = entry
+        if now - ts > _LLM_RESPONSE_CACHE_TTL_SECONDS:
+            _LLM_RESPONSE_CACHE.pop(key, None)
+            return None
+        _LLM_RESPONSE_CACHE.move_to_end(key)
+        return copy.deepcopy(result)
+
+
+def _llm_cache_set(key: str, result: dict[str, Any]) -> None:
+    now = time.monotonic()
+    with _LLM_RESPONSE_CACHE_LOCK:
+        if key in _LLM_RESPONSE_CACHE:
+            _LLM_RESPONSE_CACHE.move_to_end(key)
+        _LLM_RESPONSE_CACHE[key] = (now, copy.deepcopy(result))
+        while len(_LLM_RESPONSE_CACHE) > _LLM_RESPONSE_CACHE_MAX_SIZE:
+            _LLM_RESPONSE_CACHE.popitem(last=False)
 
 
 class LLMCircuitOpenError(httpx.HTTPError):
@@ -179,10 +235,12 @@ def _load_llm_http_resilience_settings(force_refresh: bool = False) -> dict[str,
 
 
 def _normalize_retry_policy(retry_policy: dict[str, Any] | None) -> dict[str, Any]:
+    base_policy = _load_llm_http_resilience_settings()
     if isinstance(retry_policy, dict):
-        source = dict(retry_policy)
+        source = dict(base_policy)
+        source.update(dict(retry_policy))
     else:
-        source = _load_llm_http_resilience_settings()
+        source = base_policy
     normalized = {
         "max_retries": _coerce_int_setting(source.get("max_retries"), _MAX_RETRIES, 1, 10),
         "retry_base_delay_s": _coerce_float_setting(source.get("retry_base_delay_s"), _RETRY_BASE_DELAY, 0.0, 60.0),
@@ -472,6 +530,7 @@ def _retryable_post(
             LOGGER.warning("LLM request attempt %d/%d failed with connection error: %s", attempt + 1, max_retries, exc)
         if attempt < max_retries - 1:
             delay = min(base_delay * (2 ** attempt), max_delay)
+            delay = delay * (0.5 + random.random())
             time.sleep(delay)
     if last_exc is not None:
         _record_llm_http_failure(
@@ -496,6 +555,8 @@ def _retryable_post(
 class LLMService:
     def __init__(self, config: Optional[dict[str, Any]] = None):
         self.config = config or get_llm_config()
+        self._config_snapshot = copy.deepcopy(self.config)
+        self._adapter: Optional[LLMProviderAdapter] = None
 
     def is_configured(self) -> bool:
         provider = self.config.get("provider")
@@ -503,9 +564,20 @@ class LLMService:
             return bool(self.config.get("endpoint"))
         return bool(self.config.get("endpoint") and (self.config.get("api_key") or provider in {"ollama", "vllm", "custom"}))
 
-    def chat(self, messages: list[dict[str, Any]], response_format: Optional[Any] = None) -> dict[str, Any]:
+    def _get_adapter(self) -> LLMProviderAdapter:
+        if self._adapter is None:
+            from services.llm.adapters import create_adapter
+            self._adapter = create_adapter(self.config.get("provider", ""))
+        return self._adapter
+
+    def chat(
+        self,
+        messages: list[dict[str, Any]],
+        response_format: Optional[Any] = None,
+        timeout: Optional[float] = None,
+        retry_policy: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
         start = time.perf_counter()
-        provider = self.config.get("provider")
         if not self.is_configured():
             return {
                 "content": "LLM provider is not configured. Please configure it in Settings > LLM.",
@@ -513,105 +585,99 @@ class LLMService:
                 "latency_ms": round((time.perf_counter() - start) * 1000, 2),
                 "configured": False,
             }
-        if provider == "anthropic":
-            if isinstance(response_format, dict):
-                raise ValueError(
-                    "Anthropic provider does not support response_format schema payloads in this path."
-                )
-            content, raw = self._anthropic_chat(messages, response_format=response_format)
-        else:
-            content, raw = self._openai_compatible_chat(messages, response_format=response_format)
-        return {
+        if not self.config.get("_probe_mode"):
+            capabilities = self._get_capabilities()
+            response_format = self._adapt_response_format(response_format, capabilities)
+            self._adapt_params(capabilities)
+        cache_key = _llm_cache_key(self.config, messages, response_format)
+        cached = _llm_cache_get(cache_key)
+        if cached is not None:
+            return cached
+        adapter = self._get_adapter()
+        content, raw = adapter.chat(
+            messages,
+            response_format=response_format,
+            timeout=timeout,
+            config=self.config,
+            retry_policy=retry_policy,
+        )
+        result = {
             "content": content,
             "raw": raw,
             "latency_ms": round((time.perf_counter() - start) * 1000, 2),
             "configured": True,
         }
+        if content:
+            _llm_cache_set(cache_key, result)
+        return result
 
-    def _openai_compatible_chat(self, messages: list[dict[str, Any]], response_format: Optional[Any] = None) -> tuple[str, Any]:
-        endpoint = str(self.config.get("endpoint") or "").rstrip("/")
-        circuit_key = _llm_request_circuit_key(self.config)
-        headers = {"Content-Type": "application/json"}
-        api_key = self.config.get("api_key")
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-        payload: dict[str, Any] = {
-            "model": self.config.get("model"),
-            "messages": messages,
-            "temperature": self.config.get("temperature", 0.7),
-            "max_tokens": self.config.get("max_tokens", 4096),
-        }
-        if isinstance(response_format, dict):
-            payload["response_format"] = response_format
-        elif response_format == "json":
-            payload["response_format"] = {"type": "json_object"}
-        payload.update(self.config.get("extra_params") or {})
-        with httpx.Client(timeout=httpx.Timeout(**_get_timeout_settings())) as client:
-            response = _retryable_post(
-                client,
-                f"{endpoint}/chat/completions",
-                circuit_key=circuit_key,
-                headers=headers,
-                json=payload,
-            )
-            response.raise_for_status()
-            try:
-                raw = response.json()
-            except Exception:
-                LOGGER.error("LLM returned non-JSON response (status %d): %.200s", response.status_code, response.text[:200])
-                raise ValueError(f"LLM returned non-JSON response (HTTP {response.status_code})")
-        choices = raw.get("choices") or []
-        if not choices:
-            LOGGER.warning("LLM returned empty choices: %.200s", str(raw)[:200])
-            return "", raw
-        content = choices[0].get("message", {}).get("content") or ""
-        return content, raw
-
-    def _anthropic_chat(self, messages: list[dict[str, str]], response_format: Optional[Any] = None) -> tuple[str, Any]:
-        endpoint = str(self.config.get("endpoint") or DEFAULT_ENDPOINTS["anthropic"]).rstrip("/")
-        circuit_key = _llm_request_circuit_key(self.config)
-        system = ""
-        anthropic_messages = []
-        for message in messages:
-            if message["role"] == "system":
-                system = message["content"]
-            else:
-                anthropic_messages.append(message)
-        if response_format == "json":
-            json_instruction = "Return a valid JSON object only. Do not include markdown fences or explanatory text."
-            system = f"{system}\n{json_instruction}" if system else json_instruction
-        headers = {
-            "Content-Type": "application/json",
-            "x-api-key": str(self.config.get("api_key") or ""),
-            "anthropic-version": "2023-06-01",
-        }
-        payload = {
-            "model": self.config.get("model"),
-            "system": system,
-            "messages": anthropic_messages,
-            "temperature": self.config.get("temperature", 0.7),
-            "max_tokens": self.config.get("max_tokens", 4096),
-        }
-        with httpx.Client(timeout=httpx.Timeout(**_get_timeout_settings())) as client:
-            response = _retryable_post(
-                client,
-                f"{endpoint}/v1/messages",
-                circuit_key=circuit_key,
-                headers=headers,
-                json=payload,
-            )
-            response.raise_for_status()
-            try:
-                raw = response.json()
-            except Exception:
-                LOGGER.error("Anthropic returned non-JSON response (status %d): %.200s", response.status_code, response.text[:200])
-                raise ValueError(f"Anthropic returned non-JSON response (HTTP {response.status_code})")
-        content = "".join(
-            part.get("text", "")
-            for part in (raw.get("content") or [])
-            if isinstance(part, dict) and part.get("type") == "text"
+    def _get_capabilities(self) -> dict:
+        from services.sql_routing.llm_capability import get_model_capabilities
+        return get_model_capabilities(
+            self.config.get("provider", ""),
+            self.config.get("endpoint", ""),
+            self.config.get("model", ""),
         )
-        return content, raw
+
+    def _adapt_response_format(self, response_format: Optional[Any], capabilities: dict | None = None) -> Optional[Any]:
+        from services.sql_routing.llm_capability import _adapt_response_format as _adapt_rf, _capabilities_to_tier
+        if capabilities is None:
+            capabilities = self._get_capabilities()
+        tier = _capabilities_to_tier(capabilities)
+        adapted = _adapt_rf(response_format, capabilities)
+        adapter = self._get_adapter()
+        return adapter.adapt_response_format(adapted, tier, capabilities)
+
+    def _adapt_params(self, capabilities: dict | None = None) -> None:
+        from services.sql_routing.llm_capability import _capabilities_to_tier, _get_tier_params
+        if capabilities is None:
+            capabilities = self._get_capabilities()
+        tier = _capabilities_to_tier(capabilities)
+        params = _get_tier_params(tier)
+        adapter = self._get_adapter()
+        adapter_defaults = dict(adapter.get_default_params(tier) or {})
+        user_temperature = self._config_snapshot.get("temperature")
+        user_max_tokens = self._config_snapshot.get("max_tokens")
+        user_extra_params = dict(self._config_snapshot.get("extra_params", {}) or {})
+
+        tier_temperature = params.get("temperature", 0.7)
+        tier_max_tokens = params.get("max_tokens", 4096)
+
+        if user_temperature is not None:
+            self.config["temperature"] = user_temperature
+        elif "temperature" in adapter_defaults:
+            self.config["temperature"] = adapter_defaults["temperature"]
+        else:
+            self.config["temperature"] = tier_temperature
+
+        if user_max_tokens is not None:
+            effective_max_tokens = user_max_tokens
+        elif "max_tokens" in adapter_defaults:
+            effective_max_tokens = adapter_defaults.get("max_tokens")
+        else:
+            effective_max_tokens = tier_max_tokens
+
+        try:
+            parsed_max_tokens = int(effective_max_tokens)
+            if parsed_max_tokens <= 0:
+                raise ValueError("max_tokens must be positive")
+        except Exception:
+            parsed_max_tokens = int(tier_max_tokens or 4096)
+            if parsed_max_tokens <= 0:
+                parsed_max_tokens = 4096
+        self.config["max_tokens"] = parsed_max_tokens
+
+        merged_extra_params: dict[str, Any] = {}
+        merged_extra_params.update(dict(params.get("extra_params", {}) or {}))
+
+        adapter_extra_params = dict(adapter_defaults.get("extra_params", {}) or {})
+        for key, value in adapter_defaults.items():
+            if key in {"temperature", "max_tokens", "extra_params"}:
+                continue
+            adapter_extra_params[str(key)] = value
+        merged_extra_params.update(adapter_extra_params)
+        merged_extra_params.update(user_extra_params)
+        self.config["extra_params"] = merged_extra_params
 
 
 def parse_json_object(text: str) -> dict[str, Any]:

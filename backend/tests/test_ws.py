@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import uuid
 from urllib.parse import quote
 
@@ -66,6 +67,129 @@ def test_ws_chunk_text_uses_windowed_chunk_sizes():
     assert len(chunks) == 2
     assert len(chunks[0]) == 80
     assert len(chunks[1]) == 70
+
+
+def test_ws_stream_messages_include_sequence_and_timing_metadata(test_app: TestClient, auth_headers: dict, monkeypatch):
+    from routers import ws as ws_router
+
+    def fake_run_ask_question(*args, **kwargs):
+        return {
+            "thread_id": 1888,
+            "summary": "stream metadata check",
+            "sql": "SELECT 1",
+            "response": {
+                "id": 1888,
+                "question": "Hello",
+                "sql": "SELECT 1",
+                "askingTask": {"type": "GENERAL", "status": "FINISHED"},
+            },
+        }
+
+    monkeypatch.setattr(ws_router, "run_ask_question", fake_run_ask_question)
+
+    token = auth_headers["Authorization"].removeprefix("Bearer ")
+    with test_app.websocket_connect(f"/ws/ask?token={token}") as websocket:
+        websocket.send_json({"type": "ask", "request_id": "meta-r1", "question": "Hello", "temporary": True})
+
+        seq_values: list[int] = []
+        while True:
+            message = websocket.receive_json()
+            assert message.get("type") in {"delta", "result"}
+            assert isinstance(message.get("seq"), int)
+            assert isinstance(message.get("ts"), int)
+            assert isinstance(message.get("elapsed_ms"), int)
+            seq_values.append(int(message["seq"]))
+            if message.get("type") == "result":
+                break
+
+        assert len(seq_values) >= 2
+        assert seq_values == sorted(seq_values)
+
+
+def test_ws_stream_result_payload_compacts_non_temporary(monkeypatch):
+    from routers import ask as ask_router
+
+    monkeypatch.setattr(ask_router, "_STREAM_COMPACT_RESULT", True)
+    payload = ask_router._stream_result_payload(
+        {
+            "thread_id": 123,
+            "summary": "done",
+            "sql": "SELECT 1",
+            "response": {
+                "id": 99,
+                "created_at": "2026-06-10T00:00:00Z",
+                "askingTask": {"type": "GENERAL"},
+            },
+        },
+        temporary=False,
+    )
+
+    assert payload["compact_result"] is True
+    assert payload["response"] is None
+    assert payload["response_id"] == 99
+    assert payload["summary"] == "done"
+
+
+def test_ws_stream_result_payload_keeps_full_data_for_temporary(monkeypatch):
+    from routers import ask as ask_router
+
+    monkeypatch.setattr(ask_router, "_STREAM_COMPACT_RESULT", True)
+    original = {
+        "thread_id": 123,
+        "summary": "done",
+        "sql": "SELECT 1",
+        "response": {"id": 99, "askingTask": {"type": "GENERAL"}},
+    }
+
+    payload = ask_router._stream_result_payload(original, temporary=True)
+
+    assert payload == original
+
+
+def test_ws_step_detail_is_truncated_for_long_reasoning(test_app: TestClient, auth_headers: dict, monkeypatch):
+    from routers import ws as ws_router
+    from services.step_progress import _STEP_DETAIL_MAX_CHARS
+
+    long_reasoning = "R" * 1200
+
+    def fake_run_ask_question(*args, **kwargs):
+        progress_cb = kwargs.get("progress_cb")
+        if progress_cb:
+            progress_cb("understand", "understand")
+            progress_cb("organize", long_reasoning)
+            progress_cb("answer", "answer")
+        return {
+            "thread_id": 1991,
+            "summary": "ok",
+            "sql": "SELECT 1",
+            "response": {
+                "id": 1991,
+                "question": "Hello",
+                "sql": "SELECT 1",
+                "askingTask": {"type": "GENERAL", "status": "FINISHED"},
+            },
+        }
+
+    monkeypatch.setattr(ws_router, "run_ask_question", fake_run_ask_question)
+
+    token = auth_headers["Authorization"].removeprefix("Bearer ")
+    with test_app.websocket_connect(f"/ws/ask?token={token}") as websocket:
+        websocket.send_json({"type": "ask", "request_id": "step-cap-r1", "question": "Hello", "temporary": True})
+
+        organize_detail = None
+        while True:
+            message = websocket.receive_json()
+            if message.get("type") == "delta" and message.get("content_type") == "step":
+                step_payload = json.loads(message.get("content") or "{}")
+                if step_payload.get("key") == "organize":
+                    organize_detail = str(step_payload.get("detail") or "")
+            if message.get("type") == "result":
+                break
+
+        assert organize_detail is not None
+        if _STEP_DETAIL_MAX_CHARS > 0:
+            assert len(organize_detail) <= _STEP_DETAIL_MAX_CHARS
+            assert organize_detail.endswith("...")
 
 
 def test_ws_ask_temporary_returns_result(test_app: TestClient, auth_headers: dict, test_db):

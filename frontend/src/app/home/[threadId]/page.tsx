@@ -77,6 +77,7 @@ export default function ThreadPage() {
     timer: ReturnType<typeof setTimeout>
     streamText?: string
     started?: boolean
+    dispatched?: boolean
   }>())
   const threadRefreshTimersRef = useRef<Array<ReturnType<typeof setTimeout>>>([])
   const [wsStreamText, setWsStreamText] = useState<string>('')
@@ -301,7 +302,14 @@ export default function ThreadPage() {
         setWsStreamText('')
         setWsStepProgress([])
         logAskTransport('ws_result', { requestId, started: !!pending.started })
-        pending.resolve(payload.data ?? {})
+        const resultData = (payload.data ?? {}) as Record<string, unknown>
+        if (resultData.compact_result === true && resultData.response == null) {
+          resultData.response = {
+            id: resultData.response_id as number,
+            created_at: resultData.response_created_at as string | undefined,
+          } as ThreadResponse
+        }
+        pending.resolve(resultData as AskResult)
       }
       if (payload.type === 'error') {
         clearTimeout(pending.timer)
@@ -332,8 +340,13 @@ export default function ThreadPage() {
 
     pendingWsRequests.current.forEach((pending) => {
       clearTimeout(pending.timer)
-      logAskTransport('ws_disconnected_with_pending', { started: !!pending.started })
-      pending.reject(pending.started ? createRequestStillProcessingError() : new Error(t('thread.wsDisconnected', 'WebSocket disconnected before result')))
+      const stillProcessing = !!pending.started || !!pending.dispatched
+      logAskTransport('ws_disconnected_with_pending', {
+        started: !!pending.started,
+        dispatched: !!pending.dispatched,
+        stillProcessing,
+      })
+      pending.reject(stillProcessing ? createRequestStillProcessingError() : new Error(t('thread.wsDisconnected', 'WebSocket disconnected before result')))
     })
     pendingWsRequests.current.clear()
     setWsStepProgress([])
@@ -345,8 +358,9 @@ export default function ThreadPage() {
     return () => {
       pendingRequests.forEach((pending) => {
         clearTimeout(pending.timer)
-        logAskTransport('ws_cancelled_with_pending', { started: !!pending.started })
-        pending.reject(pending.started ? createRequestStillProcessingError() : new Error('WebSocket ask cancelled'))
+        const stillProcessing = !!pending.started || !!pending.dispatched
+        logAskTransport('ws_cancelled_with_pending', { started: !!pending.started, dispatched: !!pending.dispatched, stillProcessing })
+        pending.reject(stillProcessing ? createRequestStillProcessingError() : new Error('WebSocket ask cancelled'))
       })
       pendingRequests.clear()
     }
@@ -354,15 +368,17 @@ export default function ThreadPage() {
 
   const askViaWebSocket = useCallback((question: string, previewRowLimit: number, clientRequestId: string) => new Promise<AskResult>((resolve, reject) => {
     const requestId = clientRequestId
-    logAskTransport('ws_send', { requestId, clientRequestId, previewRowLimit })
+    const dispatched = wsReadyState === 'open'
+    logAskTransport('ws_send', { requestId, clientRequestId, previewRowLimit, wsReadyState, dispatched })
     const timer = setTimeout(() => {
       const pending = pendingWsRequests.current.get(requestId)
       if (!pending) return
       pendingWsRequests.current.delete(requestId)
       setWsStreamText('')
       setWsStepProgress([])
-      logAskTransport('ws_timeout', { requestId, started: !!pending.started })
-      pending.reject(pending.started ? createRequestStillProcessingError() : new Error(t('thread.wsTimeout', 'Ask WebSocket timed out')))
+      const stillProcessing = !!pending.started || !!pending.dispatched
+      logAskTransport('ws_timeout', { requestId, started: !!pending.started, dispatched: !!pending.dispatched, stillProcessing })
+      pending.reject(stillProcessing ? createRequestStillProcessingError() : new Error(t('thread.wsTimeout', 'Ask WebSocket timed out')))
     }, Math.max(getRequestTimeout(), 600000))
     setWsStepProgress([])
     setWsStreamText('')
@@ -371,6 +387,7 @@ export default function ThreadPage() {
       reject: (reason: unknown) => { try { reject(reason) } catch { /* already settled */ } },
       timer,
       started: false,
+      dispatched,
     })
     sendWs({
       type: 'ask',
@@ -384,7 +401,7 @@ export default function ThreadPage() {
       preview_row_limit: previewRowLimit,
       temporary: isTemporaryThread,
     })
-  }), [createRequestStillProcessingError, isTemporaryThread, locale, logAskTransport, numericThreadId, previousAnswersContext, previousQuestionsContext, sendWs, t, threadId])
+  }), [createRequestStillProcessingError, isTemporaryThread, locale, logAskTransport, numericThreadId, previousAnswersContext, previousQuestionsContext, sendWs, t, threadId, wsReadyState])
 
   const askViaSSE = useCallback(async (question: string, previewRowLimit: number, clientRequestId: string): Promise<AskResult> => {
     setWsStepProgress([])
@@ -519,7 +536,14 @@ export default function ThreadPage() {
       }
       if (type === 'result' && parsed.data && typeof parsed.data === 'object') {
         markServerStarted()
-        finalResult = parsed.data as AskResult
+        const resultData = parsed.data as Record<string, unknown>
+        if (resultData.compact_result === true && resultData.response == null) {
+          resultData.response = {
+            id: resultData.response_id as number,
+            created_at: resultData.response_created_at as string | undefined,
+          } as ThreadResponse
+        }
+        finalResult = resultData as AskResult
       }
     }
 
@@ -613,7 +637,7 @@ export default function ThreadPage() {
         wsOpen: wsReadyState === 'open',
         longConnectionOnly: !ENABLE_HTTP_SHORT_FALLBACK,
       })
-      if (wsReadyState !== 'closed') {
+      if (wsReadyState === 'open') {
         try {
           const wsResult = await askViaWebSocket(question, previewRowLimit, clientRequestId)
           logAskTransport('ws_success', { clientRequestId })
@@ -631,7 +655,7 @@ export default function ThreadPage() {
           }
         }
       } else {
-        logAskTransport('ws_skipped_closed', { clientRequestId })
+        logAskTransport('ws_skipped_not_open', { clientRequestId, wsReadyState })
       }
 
       try {

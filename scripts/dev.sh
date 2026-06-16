@@ -36,12 +36,16 @@ pip install -q -e "$BACKEND_DIR" 2>&1 | tail -1
 
 echo "[backend] Starting uvicorn on :8400..."
 cd "$BACKEND_DIR"
+WS_PING_INTERVAL="${PRISMBI_WS_PING_INTERVAL:-20}"
+WS_PING_TIMEOUT="${PRISMBI_WS_PING_TIMEOUT:-20}"
 uvicorn main:app \
   --host 0.0.0.0 \
   --port 8400 \
   --reload \
   --reload-dir "$BACKEND_DIR" \
   --env-file .env \
+  --ws-ping-interval "$WS_PING_INTERVAL" \
+  --ws-ping-timeout "$WS_PING_TIMEOUT" \
   --log-level info &
 BACKEND_PID=$!
 

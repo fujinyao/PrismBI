@@ -1036,6 +1036,8 @@ class LLMUpdate(BaseModel):
     temperature: Optional[float] = None
     extra_params: Optional[dict] = None
     system_prompt: Optional[str] = None
+    probed_capabilities: Optional[dict[str, Any]] = None
+    probe_session_id: Optional[str] = None
 
 
 class LLMEndpointWhitelistUpdate(BaseModel):
@@ -1048,6 +1050,7 @@ class LLMTestRequest(BaseModel):
     api_key: Optional[str] = None
     model: str
     endpoint: Optional[str] = None
+    probe_level: Optional[str] = Field(default=None, pattern=r"^(fast|full)$")
 
 
 class LLMModelsRequest(BaseModel):
@@ -1069,28 +1072,6 @@ class GeneralUpdate(BaseModel):
     timezone: Optional[str] = None
     date_format: Optional[str] = None
     session_timeout: Optional[int] = None
-    route_observability_window_minutes: Optional[int] = Field(default=None, ge=5, le=1440)
-    request_timeout_ms: Optional[int] = Field(default=None, ge=1000, le=1800000)
-    llm_connect_timeout_s: Optional[int] = Field(default=None, ge=1, le=3600)
-    llm_read_timeout_s: Optional[int] = Field(default=None, ge=1, le=3600)
-    llm_write_timeout_s: Optional[int] = Field(default=None, ge=1, le=3600)
-    llm_pool_timeout_s: Optional[int] = Field(default=None, ge=1, le=3600)
-    db_connect_timeout_s: Optional[int] = Field(default=None, ge=1, le=3600)
-    model_list_timeout_s: Optional[int] = Field(default=None, ge=1, le=3600)
-    route_observability_persist_enabled: Optional[bool] = None
-    route_observability_persist_interval_seconds: Optional[float] = Field(default=None, ge=1.0, le=3600.0)
-    route_observability_persist_event_delta: Optional[int] = Field(default=None, ge=1, le=10000)
-    model_ref_case_sensitive: Optional[bool] = None
-
-
-class TimeoutUpdate(BaseModel):
-    request_timeout_ms: Optional[int] = Field(default=None, ge=1000, le=1800000)
-    llm_connect_timeout_s: Optional[int] = Field(default=None, ge=1, le=3600)
-    llm_read_timeout_s: Optional[int] = Field(default=None, ge=1, le=3600)
-    llm_write_timeout_s: Optional[int] = Field(default=None, ge=1, le=3600)
-    llm_pool_timeout_s: Optional[int] = Field(default=None, ge=1, le=3600)
-    db_connect_timeout_s: Optional[int] = Field(default=None, ge=1, le=3600)
-    model_list_timeout_s: Optional[int] = Field(default=None, ge=1, le=3600)
 
 
 class LLMAdvancedUpdate(BaseModel):
@@ -1135,6 +1116,24 @@ class RouterSettingsUpdate(BaseModel):
     decompose_merge_circuit_enabled: Optional[bool] = None
     decompose_merge_failure_threshold: Optional[int] = Field(default=None, ge=1, le=20)
     decompose_merge_disable_seconds: Optional[float] = Field(default=None, ge=30.0, le=86400.0)
+    sql_generation_total_budget_s: Optional[float] = Field(default=None, ge=10.0, le=900.0)
+    sql_generation_timeout_cap_s: Optional[float] = Field(default=None, ge=1.0, le=300.0)
+    sql_generation_timeout_min_s: Optional[float] = Field(default=None, ge=0.1, le=60.0)
+    json_reask_timeout_cap_s: Optional[float] = Field(default=None, ge=0.5, le=120.0)
+    json_reask_timeout_min_s: Optional[float] = Field(default=None, ge=0.1, le=30.0)
+    decompose_merge_stage_budget_s: Optional[float] = Field(default=None, ge=1.0, le=900.0)
+    llm_sub_query_timeout_s: Optional[float] = Field(default=None, ge=1.0, le=300.0)
+    llm_merge_timeout_s: Optional[float] = Field(default=None, ge=1.0, le=600.0)
+    duckdb_did_you_mean_fix_enabled: Optional[bool] = None
+    duckdb_did_you_mean_allow_internal_tables: Optional[bool] = None
+    duckdb_did_you_mean_max_retries: Optional[int] = Field(default=None, ge=0, le=5)
+    request_timeout_ms: Optional[int] = Field(default=None, ge=1000, le=1800000)
+    llm_connect_timeout_s: Optional[int] = Field(default=None, ge=1, le=3600)
+    llm_read_timeout_s: Optional[int] = Field(default=None, ge=1, le=3600)
+    llm_write_timeout_s: Optional[int] = Field(default=None, ge=1, le=3600)
+    llm_pool_timeout_s: Optional[int] = Field(default=None, ge=1, le=3600)
+    db_connect_timeout_s: Optional[int] = Field(default=None, ge=1, le=3600)
+    model_list_timeout_s: Optional[int] = Field(default=None, ge=1, le=3600)
     external_connection_pool_enabled: Optional[bool] = None
     external_connection_pool_max_per_key: Optional[int] = Field(default=None, ge=1, le=64)
     external_connection_pool_idle_seconds: Optional[float] = Field(default=None, ge=30.0, le=86400.0)
@@ -1149,6 +1148,22 @@ class RouterSettingsUpdate(BaseModel):
     route_observability_strategy_trend_max_points: Optional[int] = Field(default=None, ge=6, le=240)
     route_observability_strategy_trend_persist_interval_seconds: Optional[float] = Field(default=None, ge=1.0, le=3600.0)
     route_observability_strategy_trend_persist_decision_delta: Optional[int] = Field(default=None, ge=1, le=10000)
+    route_alert_repair_timeout_short_circuit_warning_rate: Optional[float] = Field(default=None, ge=0.01, le=1.0)
+    route_alert_repair_timeout_short_circuit_critical_rate: Optional[float] = Field(default=None, ge=0.01, le=1.0)
+    route_alert_repair_timeout_short_circuit_min_warning_events: Optional[int] = Field(default=None, ge=1, le=10000)
+    route_alert_repair_timeout_short_circuit_min_critical_events: Optional[int] = Field(default=None, ge=1, le=10000)
+    route_alert_repair_budget_low_short_circuit_warning_rate: Optional[float] = Field(default=None, ge=0.01, le=1.0)
+    route_alert_repair_budget_low_short_circuit_critical_rate: Optional[float] = Field(default=None, ge=0.01, le=1.0)
+    route_alert_repair_budget_low_short_circuit_min_warning_events: Optional[int] = Field(default=None, ge=1, le=10000)
+    route_alert_repair_budget_low_short_circuit_min_critical_events: Optional[int] = Field(default=None, ge=1, le=10000)
+    route_alert_json_reask_warning_rate: Optional[float] = Field(default=None, ge=0.01, le=1.0)
+    route_alert_json_reask_critical_rate: Optional[float] = Field(default=None, ge=0.01, le=1.0)
+    route_alert_json_reask_min_warning_decisions: Optional[int] = Field(default=None, ge=1, le=10000)
+    route_alert_json_reask_min_critical_decisions: Optional[int] = Field(default=None, ge=1, le=10000)
+    route_alert_decompose_cancelled_warning_rate: Optional[float] = Field(default=None, ge=0.01, le=1.0)
+    route_alert_decompose_cancelled_critical_rate: Optional[float] = Field(default=None, ge=0.01, le=1.0)
+    route_alert_decompose_cancelled_min_warning_events: Optional[int] = Field(default=None, ge=1, le=10000)
+    route_alert_decompose_cancelled_min_critical_events: Optional[int] = Field(default=None, ge=1, le=10000)
     sql_route_v2_enabled: Optional[bool] = None
     sql_route_allowlist_projects: Optional[List[int]] = None
     sql_route_shadow_mode: Optional[bool] = None

@@ -1,0 +1,115 @@
+from __future__ import annotations
+
+import os
+from typing import Any
+
+
+BACKEND_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+PROJECT_DATA_DIR = os.path.join(BACKEND_DIR, "data", "projects")
+MAX_SQL_ROWS = 200
+DEFAULT_PREVIEW_ROW_LIMIT = 20
+MIN_PREVIEW_ROW_LIMIT = 5
+MAX_PREVIEW_ROW_LIMIT = 100
+MIN_EXECUTION_ROW_LIMIT = 1
+MAX_EXECUTION_ROW_LIMIT = 10000
+MAX_SOURCE_MATERIALIZATION_ROWS = 5000
+ROUTER_CONFIG: dict[str, Any] = {
+    "tier1_max_retries": 1,
+    "tier2_max_retries": 2,
+    "tier3_max_retries": 2,
+    "adaptive_strategy_enabled": True,
+    "adaptive_strategy_consensus_risk_threshold": 4,
+    "adaptive_strategy_decompose_risk_threshold": 7,
+    "adaptive_strategy_min_subquestions_for_decompose": 2,
+    "tier1_max_columns_per_model": 12,
+    "tier2_max_columns_per_model": 15,
+    "tier3_max_columns_per_model": 20,
+    "max_sub_questions": 3,
+    "max_suggested_questions": 5,
+    "metadata_summary_max_models": 10,
+    "guidance_llm_available": True,
+    "schema_pruning_enabled": True,
+    "cross_source_max_workers": 4,
+    "decompose_merge_enabled": True,
+    "decompose_merge_circuit_enabled": True,
+    "decompose_merge_failure_threshold": 1,
+    "decompose_merge_disable_seconds": 3600,
+    "decompose_merge_stage_budget_s": 150.0,
+    "sql_generation_total_budget_s": 300.0,
+    "sql_repair_timeout_cap_s": 39.6,
+    "sql_repair_skip_if_remaining_budget_below_s": 15.84,
+    "sql_generation_timeout_cap_s": 120.0,
+    "sql_generation_timeout_min_s": 2.04,
+    "json_reask_timeout_cap_s": 20.0,
+    "json_reask_timeout_min_s": 0.5,
+    "llm_sub_query_timeout_s": 90.0,
+    "llm_merge_timeout_s": 120.0,
+    "sql_repair_local_preflight_enabled": True,
+    "duckdb_did_you_mean_fix_enabled": True,
+    "duckdb_did_you_mean_allow_internal_tables": False,
+    "duckdb_did_you_mean_max_retries": 1,
+    "external_connection_pool_enabled": True,
+    "external_connection_pool_max_per_key": 4,
+    "external_connection_pool_idle_seconds": 300,
+    "execution_metrics_log_every": 25,
+    "execution_metrics_log_interval_seconds": 180,
+    "execution_metrics_max_samples": 400,
+    "route_observability_window_seconds": 1800,
+    "route_observability_max_events_per_project": 20000,
+    "route_observability_persist_enabled": True,
+    "route_observability_persist_interval_seconds": 30,
+    "route_observability_persist_event_delta": 20,
+    "route_observability_strategy_trend_max_points": 24,
+    "route_observability_strategy_trend_persist_interval_seconds": 60,
+    "route_observability_strategy_trend_persist_decision_delta": 5,
+    "route_alert_repair_timeout_short_circuit_warning_rate": 0.25,
+    "route_alert_repair_timeout_short_circuit_critical_rate": 0.45,
+    "route_alert_repair_timeout_short_circuit_min_warning_events": 6,
+    "route_alert_repair_timeout_short_circuit_min_critical_events": 12,
+    "route_alert_repair_budget_low_short_circuit_warning_rate": 0.20,
+    "route_alert_repair_budget_low_short_circuit_critical_rate": 0.35,
+    "route_alert_repair_budget_low_short_circuit_min_warning_events": 6,
+    "route_alert_repair_budget_low_short_circuit_min_critical_events": 12,
+    "route_alert_json_reask_warning_rate": 0.20,
+    "route_alert_json_reask_critical_rate": 0.40,
+    "route_alert_json_reask_min_warning_decisions": 10,
+    "route_alert_json_reask_min_critical_decisions": 20,
+    "route_alert_decompose_cancelled_warning_rate": 0.15,
+    "route_alert_decompose_cancelled_critical_rate": 0.30,
+    "route_alert_decompose_cancelled_min_warning_events": 6,
+    "route_alert_decompose_cancelled_min_critical_events": 12,
+    "sql_route_v2_enabled": True,
+    "sql_route_allowlist_projects": [],
+    "sql_route_shadow_mode": False,
+    "sql_route_event_persist_enabled": True,
+    "model_ref_case_sensitive": True,
+    "sql_route_profile_id": "prismbi.default",
+    "sql_route_profile_version": "v2",
+    "sql_route_strict_json_probe_enabled": True,
+    "request_timeout_ms": 120000,
+    "llm_connect_timeout_s": 30,
+    "llm_read_timeout_s": 120,
+    "llm_write_timeout_s": 30,
+    "llm_pool_timeout_s": 30,
+    "db_connect_timeout_s": 10,
+    "model_list_timeout_s": 30,
+}
+_RUNTIME_SETTINGS_CACHE_TTL: float = 30.0
+_RUNTIME_ASK_DEFAULTS = {
+    "max_sql_rows": 200,
+    "default_preview_row_limit": 20,
+    "min_preview_row_limit": 5,
+    "max_preview_row_limit": 100,
+    "max_source_materialization_rows": 5000,
+    "analysis_cache_max": 128,
+    "analysis_cache_ttl_s": 300.0,
+}
+_CONNECTION_TIMEOUTS: dict[str, Any] = {
+    "duckdb": {"connect": 10},
+    "postgresql": {"connect": 10, "statement": 30000},
+    "mysql": {"connect": 10, "login": 10, "query": 30000, "network": 60},
+    "clickhouse": {"connect": 10, "send_receive": 60, "query": 60},
+    "mssql": {"connect": 10, "login": 10, "lock": 30000},
+    "oracle": {"call": 30000},
+    "snowflake": {"login": 10, "network": 60},
+}

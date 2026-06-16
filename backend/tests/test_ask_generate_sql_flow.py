@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import httpx
 from types import SimpleNamespace
 
 import services.ask_service as ask_service
@@ -65,7 +66,7 @@ def test_generate_sql_repairs_unknown_columns_from_bad_alias(monkeypatch):
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             return {
                 "content": json.dumps(
                     {
@@ -113,7 +114,7 @@ def test_generate_sql_skips_second_generation_after_successful_column_repair(mon
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             llm_calls["count"] += 1
             return {
                 "content": json.dumps(
@@ -166,7 +167,7 @@ def test_generate_sql_skips_second_generation_after_orphan_cte_repair(monkeypatc
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             llm_calls["count"] += 1
             return {
                 "content": json.dumps(
@@ -214,7 +215,7 @@ def test_generate_sql_auto_completes_single_cte_without_llm_repair(monkeypatch):
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             return {
                 "content": json.dumps(
                     {
@@ -267,7 +268,7 @@ def test_generate_sql_repairs_syntax_issues_before_return(monkeypatch):
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             return {
                 "content": json.dumps(
                     {
@@ -335,7 +336,7 @@ def test_generate_sql_groupby_repair_includes_aggregation_hint(monkeypatch):
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             return {
                 "content": json.dumps(
                     {
@@ -396,7 +397,7 @@ def test_generate_sql_groupby_auto_completion_skips_llm_repair(monkeypatch):
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             return {
                 "content": json.dumps(
                     {
@@ -433,6 +434,8 @@ def test_generate_sql_groupby_auto_completion_skips_llm_repair(monkeypatch):
 def test_generate_sql_opens_unknown_issue_circuit_on_repeated_alias_scope_leak(monkeypatch):
     _patch_prompt_helpers(monkeypatch)
 
+    monkeypatch.setitem(ask_service.ROUTER_CONFIG, "unknown_issue_bucket_circuit_threshold", 2)
+
     problematic_sql = (
         "WITH sales_cte AS ("
         "SELECT oi.product_id, SUM(oi.price) AS total_sales "
@@ -465,7 +468,7 @@ def test_generate_sql_opens_unknown_issue_circuit_on_repeated_alias_scope_leak(m
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             llm_calls["count"] += 1
             return {
                 "content": json.dumps(
@@ -521,6 +524,105 @@ def test_generate_sql_opens_unknown_issue_circuit_on_repeated_alias_scope_leak(m
     assert "repeated unknown-column bucket" in str(result.get("reasoning") or "").lower()
 
 
+def test_generate_sql_opens_unknown_issue_circuit_on_mixed_circuitable_buckets(monkeypatch):
+    _patch_prompt_helpers(monkeypatch)
+
+    monkeypatch.setitem(ask_service.ROUTER_CONFIG, "unknown_issue_bucket_circuit_threshold", 2)
+
+    generated_sql = "SELECT o.order_id FROM olist_orders_dataset o"
+    semantic_hits = {
+        "has_hits": True,
+        "models": [
+            {
+                "name": "olist_orders_dataset",
+                "table_reference": "olist_orders_dataset",
+                "columns": [{"name": "order_id", "type": "VARCHAR"}],
+            }
+        ],
+        "relations": [],
+    }
+
+    llm_calls = {"count": 0}
+
+    class FakeLLM:
+        def is_configured(self):
+            return True
+
+        def chat(self, messages, response_format="json", **kwargs):
+            llm_calls["count"] += 1
+            return {
+                "content": json.dumps(
+                    {
+                        "sql": generated_sql,
+                        "summary": "bad owner",
+                        "reasoning": "initial",
+                    }
+                )
+            }
+
+    guard_calls = {"count": 0}
+
+    class FakeGuard:
+        def inspect(self, *_args, **_kwargs):
+            guard_calls["count"] += 1
+            if guard_calls["count"] == 1:
+                bad_columns = ["o.order_id (belongs on: olist_orders_dataset, olist_order_items_dataset)"]
+            else:
+                bad_columns = ["o.order_id (belongs on: olist_orders_dataset)"]
+            return SimpleNamespace(
+                syntax_issues=[],
+                columns_inconclusive=False,
+                bad_columns=bad_columns,
+            )
+
+    repair_calls = {"count": 0}
+
+    def fake_repair(*args, **kwargs):
+        repair_calls["count"] += 1
+        return {
+            "sql": None,
+            "summary": "repair failed",
+            "reasoning": "no fix",
+            "configured": True,
+        }
+
+    monkeypatch.setattr(ask_service, "LLMService", FakeLLM)
+    monkeypatch.setattr(ask_service, "_candidate_guard", lambda: FakeGuard())
+    monkeypatch.setattr(ask_service, "_repair_sql", fake_repair)
+    monkeypatch.setattr(
+        ask_service,
+        "_select_sql_strategy",
+        lambda analysis, has_knowledge: {"engine": "fewshot_cot", "max_retries": 3, "use_examples": False},
+    )
+    monkeypatch.setattr(ask_service, "_apply_owner_selector_rules", lambda sql, *_args, **_kwargs: sql)
+    monkeypatch.setattr(ask_service, "_apply_hallucinated_column_rewrite_rules", lambda sql, *_args, **_kwargs: sql)
+    monkeypatch.setattr(ask_service, "_apply_alias_scope_rewrite_rules", lambda sql, *_args, **_kwargs: sql)
+    monkeypatch.setattr(ask_service, "_validate_sql_columns", lambda _sql, _hit_models: ["o.order_id still unknown"])
+    monkeypatch.setattr(ask_service, "_enforce_group_by_constraints", lambda sql, *_args, **_kwargs: (sql, []))
+
+    result = ask_service._generate_sql(
+        question="测试混合列归属错误回路",
+        project_id=1,
+        semantic_context="ctx",
+        retrieved_tables=["olist_orders_dataset"],
+        semantic_hits=semantic_hits,
+        language="zh",
+        analysis={
+            "tier": "multi_dimension",
+            "dimensions": ["order_id"],
+            "metrics": ["count"],
+            "entities": [],
+            "sub_questions": [],
+        },
+    )
+
+    assert repair_calls["count"] == 1
+    assert llm_calls["count"] == 2
+    assert result.get("sql") is None
+    assert str(result.get("sql_engine") or "").endswith("_validation_circuit_open")
+    assert "repeated unknown-column bucket" in str(result.get("reasoning") or "").lower()
+
+
 def test_repair_sql_includes_ambiguous_owner_hint_in_prompt(monkeypatch):
     _patch_prompt_helpers(monkeypatch)
 
@@ -530,7 +632,7 @@ def test_repair_sql_includes_ambiguous_owner_hint_in_prompt(monkeypatch):
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             captured_prompt["user"] = "\n".join(m.get("content", "") for m in messages if m.get("role") == "user")
             return {
                 "content": json.dumps(
@@ -561,7 +663,244 @@ def test_repair_sql_includes_ambiguous_owner_hint_in_prompt(monkeypatch):
     assert repair["sql"]
     assert "Ambiguous owner resolution hints:" in captured_prompt["user"]
     assert "prefer owner 'olist_orders_dataset'" in captured_prompt["user"]
-    assert "ORDER BY and HAVING column must either be a GROUP BY key" in captured_prompt["user"]
+    assert "ORDER BY and HAVING columns must be GROUP BY keys or wrapped in aggregate functions" in captured_prompt["user"]
+
+
+def test_repair_sql_local_preflight_prunes_orphan_cte_without_llm_roundtrip(monkeypatch):
+    _patch_prompt_helpers(monkeypatch)
+    monkeypatch.setitem(ask_service.ROUTER_CONFIG, "sql_repair_local_preflight_enabled", True)
+    monkeypatch.setattr(ask_service, "_validate_sql_syntax_for_project", lambda _sql, _project_id: [])
+
+    chat_calls = {"count": 0}
+
+    class FakeLLM:
+        def is_configured(self):
+            return True
+
+        def chat(self, messages, response_format="json", **kwargs):
+            chat_calls["count"] += 1
+            raise AssertionError("LLM chat should not be called when local preflight resolves orphan CTE")
+
+    monkeypatch.setattr(ask_service, "LLMService", FakeLLM)
+
+    repair = ask_service._repair_sql(
+        question="查看员工编号",
+        failed_sql=(
+            "WITH employees_roles AS (SELECT emp_no FROM employees) "
+            "SELECT emp_no FROM employees"
+        ),
+        error="CTE(s) defined but never referenced: employees_roles",
+        project_id=1,
+        semantic_context="Project semantic model: employees(emp_no)",
+        language="zh",
+    )
+
+    normalized_sql = str(repair.get("sql") or "").lower()
+    assert normalized_sql == "select emp_no from employees"
+    assert chat_calls["count"] == 0
+    assert "local repair preflight" in str(repair.get("reasoning") or "").lower()
+
+
+def test_repair_sql_local_preflight_rewrites_dotted_alias_without_llm_roundtrip(monkeypatch):
+    _patch_prompt_helpers(monkeypatch)
+    monkeypatch.setitem(ask_service.ROUTER_CONFIG, "sql_repair_local_preflight_enabled", True)
+
+    def _fake_validate(sql: str, _project_id: int) -> list[str]:
+        return [] if "department_dept_no" in sql else ["Parser Error: syntax error at or near '.'"]
+
+    monkeypatch.setattr(ask_service, "_validate_sql_syntax_for_project", _fake_validate)
+
+    chat_calls = {"count": 0}
+
+    class FakeLLM:
+        def is_configured(self):
+            return True
+
+        def chat(self, messages, response_format="json", **kwargs):
+            chat_calls["count"] += 1
+            raise AssertionError("LLM chat should not be called when local preflight resolves dotted alias syntax")
+
+    monkeypatch.setattr(ask_service, "LLMService", FakeLLM)
+
+    repair = ask_service._repair_sql(
+        question="按部门查看编号",
+        failed_sql="SELECT T1.dept_no AS department.dept_no FROM dept_emp T1",
+        error=(
+            "Parser Error: syntax error at or near \".\"\n"
+            "LINE 1: SELECT T1.dept_no AS department.dept_no FROM dept_emp T1"
+        ),
+        project_id=1,
+        semantic_context="Project semantic model: dept_emp(dept_no)",
+        language="zh",
+    )
+
+    normalized_sql = str(repair.get("sql") or "").lower()
+    assert "as department_dept_no" in normalized_sql
+    assert chat_calls["count"] == 0
+    assert "local repair preflight" in str(repair.get("reasoning") or "").lower()
+
+
+def test_repair_sql_skips_llm_when_remaining_budget_is_too_low(monkeypatch):
+    _patch_prompt_helpers(monkeypatch)
+    monkeypatch.setitem(ask_service.ROUTER_CONFIG, "sql_repair_local_preflight_enabled", False)
+    monkeypatch.setitem(ask_service.ROUTER_CONFIG, "sql_repair_skip_if_remaining_budget_below_s", 8.0)
+
+    chat_calls = {"count": 0}
+
+    class FakeLLM:
+        def is_configured(self):
+            return True
+
+        def chat(self, messages, response_format="json", **kwargs):
+            chat_calls["count"] += 1
+            raise AssertionError("LLM chat should be skipped when remaining repair budget is too low")
+
+    monkeypatch.setattr(ask_service, "LLMService", FakeLLM)
+
+    repair = ask_service._repair_sql(
+        question="测试预算不足",
+        failed_sql="SELECT t1.unknown_column FROM dept_emp t1",
+        error="Unknown columns: t1.unknown_column",
+        project_id=1,
+        semantic_context="Project semantic model: dept_emp(emp_no, dept_no)",
+        language="zh",
+        timeout_cap_s=1.0,
+    )
+
+    assert repair.get("sql") is None
+    assert "low remaining generation budget" in str(repair.get("reasoning") or "").lower()
+    assert chat_calls["count"] == 0
+
+
+def test_repair_sql_does_not_retry_after_timeout_error(monkeypatch):
+    _patch_prompt_helpers(monkeypatch)
+    monkeypatch.setitem(ask_service.ROUTER_CONFIG, "sql_repair_local_preflight_enabled", False)
+    monkeypatch.setitem(ask_service.ROUTER_CONFIG, "sql_repair_skip_if_remaining_budget_below_s", 0.5)
+
+    chat_calls = {"count": 0}
+
+    class FakeLLM:
+        def is_configured(self):
+            return True
+
+        def chat(self, messages, response_format="json", **kwargs):
+            chat_calls["count"] += 1
+            raise httpx.ReadTimeout("timed out")
+
+    monkeypatch.setattr(ask_service, "LLMService", FakeLLM)
+
+    import services.sql_routing.llm_capability as llm_capability
+
+    monkeypatch.setattr(
+        llm_capability,
+        "_get_repair_config",
+        lambda _tier: {
+            "max_repair_attempts": 2,
+            "json_parse_retries": 1,
+            "skip_repair_if_json_empty": False,
+            "repair_timeout_s": 60,
+            "retry_on_binder_error": True,
+        },
+    )
+
+    repair = ask_service._repair_sql(
+        question="测试超时",
+        failed_sql="SELECT t1.order_id FROM olist_orders_dataset t1",
+        error="column not found",
+        project_id=1,
+        semantic_context="Project semantic model: olist_orders_dataset(order_id)",
+        language="zh",
+        timeout_cap_s=30.0,
+    )
+
+    assert repair.get("sql") is None
+    assert chat_calls["count"] == 1
+    assert "readtimeout" in str(repair.get("reasoning") or "").lower()
+
+
+def test_repair_sql_opens_unknown_issue_circuit_on_mixed_circuitable_buckets(monkeypatch):
+    _patch_prompt_helpers(monkeypatch)
+    monkeypatch.setitem(ask_service.ROUTER_CONFIG, "unknown_issue_bucket_circuit_threshold", 2)
+    monkeypatch.setitem(ask_service.ROUTER_CONFIG, "sql_repair_local_preflight_enabled", False)
+    monkeypatch.setitem(ask_service.ROUTER_CONFIG, "sql_repair_skip_if_remaining_budget_below_s", 0.5)
+
+    import services.sql_routing.llm_capability as llm_capability
+
+    monkeypatch.setattr(
+        llm_capability,
+        "_get_repair_config",
+        lambda _tier: {
+            "max_repair_attempts": 3,
+            "json_parse_retries": 1,
+            "skip_repair_if_json_empty": False,
+            "repair_timeout_s": 60,
+            "retry_on_binder_error": True,
+        },
+    )
+
+    llm_calls = {"count": 0}
+
+    class FakeLLM:
+        def is_configured(self):
+            return True
+
+        def chat(self, messages, response_format="json", **kwargs):
+            llm_calls["count"] += 1
+            if llm_calls["count"] == 1:
+                sql = "SELECT t3.order_id FROM olist_sellers_dataset t3"
+            else:
+                sql = "SELECT t3.product_id FROM olist_sellers_dataset t3"
+            return {
+                "content": json.dumps(
+                    {
+                        "sql": sql,
+                        "summary": "repair candidate",
+                        "reasoning": "candidate",
+                    }
+                )
+            }
+
+    validation_calls = {"count": 0}
+
+    def fake_validate(_sql: str, _models: list[dict[str, object]]):
+        validation_calls["count"] += 1
+        if validation_calls["count"] == 1:
+            return ["t3.order_id (belongs on: olist_orders_dataset, olist_order_items_dataset)"]
+        return ["t3.product_id (belongs on: olist_order_items_dataset)"]
+
+    events: list[tuple[str, dict, int | None]] = []
+
+    monkeypatch.setattr(ask_service, "LLMService", FakeLLM)
+    monkeypatch.setattr(ask_service, "_validate_sql_columns", fake_validate)
+    monkeypatch.setattr(
+        ask_service,
+        "_emit_route_event",
+        lambda event_type, payload, project_id=None: events.append((event_type, payload, project_id)),
+    )
+
+    repair = ask_service._repair_sql(
+        question="测试 repair 混合 issue 回路",
+        failed_sql="SELECT t1.order_id FROM olist_sellers_dataset t1",
+        error="Unknown columns: t1.order_id",
+        project_id=1,
+        semantic_context="Project semantic model: ...",
+        language="zh",
+        hit_models=[
+            {"name": "olist_sellers_dataset", "table_reference": "olist_sellers_dataset", "columns": [{"name": "seller_id"}]},
+            {"name": "olist_orders_dataset", "table_reference": "olist_orders_dataset", "columns": [{"name": "order_id"}]},
+            {"name": "olist_order_items_dataset", "table_reference": "olist_order_items_dataset", "columns": [{"name": "order_id"}, {"name": "product_id"}]},
+        ],
+    )
+
+    assert repair.get("sql") is None
+    assert "repeated unknown-column bucket" in str(repair.get("reasoning") or "").lower()
+    assert llm_calls["count"] == 2
+    assert validation_calls["count"] == 2
+    short_circuit = [item for item in events if item[0] == "sql_repair_short_circuit"]
+    assert short_circuit
+    _event_type, payload, _pid = short_circuit[-1]
+    assert payload.get("reason") == "repeated_issue_bucket"
+    assert int(payload.get("circuitable_issue_bucket_streak") or 0) >= 2
 
 
 def test_generate_sql_includes_schema_link_and_structured_plan_hints(monkeypatch):
@@ -572,7 +911,7 @@ def test_generate_sql_includes_schema_link_and_structured_plan_hints(monkeypatch
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             captured["users"].append("\n".join(m.get("content", "") for m in messages if m.get("role") == "user"))
             return {
                 "content": json.dumps(
@@ -610,7 +949,7 @@ def test_generate_sql_includes_owner_lock_constraints_in_initial_prompt(monkeypa
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             captured["user_prompt"] = "\n".join(
                 m.get("content", "") for m in messages if m.get("role") == "user"
             )
@@ -665,7 +1004,7 @@ def test_generate_sql_prefers_resolved_dimensions_when_raw_cjk_labels_are_unmapp
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             return {
                 "content": json.dumps(
                     {
@@ -737,7 +1076,7 @@ def test_generate_sql_alias_scope_local_rewrite_skips_llm_repair(monkeypatch):
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             return {
                 "content": json.dumps(
                     {
@@ -842,7 +1181,7 @@ def test_generate_sql_local_rewrite_handles_ambiguous_owner_and_hallucinated_qua
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             llm_calls["count"] += 1
             return {
                 "content": json.dumps(
@@ -937,7 +1276,7 @@ def test_generate_sql_skips_decompose_merge_when_only_one_sub_question(monkeypat
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             llm_calls["count"] += 1
             return {
                 "content": json.dumps(
@@ -1024,7 +1363,7 @@ def test_generate_sql_auto_repairs_non_grouped_order_by_aggregation_clause(monke
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             return {
                 "content": json.dumps(
                     {
@@ -1102,7 +1441,7 @@ def test_classify_question_route_normalizes_structured_filters_and_mixed_terms(m
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             captured["user_prompt"] = "\n".join(m.get("content", "") for m in messages if m.get("role") == "user")
             return {
                 "content": json.dumps(
@@ -1166,7 +1505,7 @@ def test_classify_question_route_parse_failure_defaults_to_sql_path(monkeypatch)
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             return {"content": "NOT_JSON"}
 
     monkeypatch.setattr(ask_service, "LLMService", FakeLLM)
@@ -1192,7 +1531,7 @@ def test_summarize_query_result_handles_mixed_sub_question_types(monkeypatch):
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             return {"content": "By city, Beijing has total_sales 100."}
 
     monkeypatch.setattr(ask_service, "LLMService", FakeLLM)
@@ -1224,7 +1563,7 @@ def test_repair_sql_falls_back_to_plain_text_sql_when_json_parse_fails(monkeypat
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             return {
                 "content": (
                     "I fixed the query.\n"
@@ -1250,6 +1589,100 @@ def test_repair_sql_falls_back_to_plain_text_sql_when_json_parse_fails(monkeypat
     assert "plain-text fallback" in (repair.get("reasoning") or "")
 
 
+def test_generate_sql_uses_strict_json_reask_then_repair_for_non_json_sql_payload(monkeypatch):
+    _patch_prompt_helpers(monkeypatch)
+
+    llm_calls = {"count": 0}
+    repair_calls = {"count": 0}
+    repaired_sql = "SELECT SUM(o.price) AS total_sales FROM olist_order_items_dataset o"
+
+    class FakeLLM:
+        def is_configured(self):
+            return True
+
+        def chat(self, messages, response_format="json", **kwargs):
+            llm_calls["count"] += 1
+            if llm_calls["count"] == 1:
+                return {
+                    "content": (
+                        "```sql\n"
+                        "SELECT SUM(o.price) AS total_sales FROM olist_order_items_dataset o\n"
+                        "```"
+                    )
+                }
+            return {"content": "SELECT SUM(o.price) AS total_sales FROM olist_order_items_dataset o"}
+
+    monkeypatch.setattr(ask_service, "LLMService", FakeLLM)
+
+    def fake_repair(*args, **kwargs):
+        repair_calls["count"] += 1
+        return {
+            "sql": repaired_sql,
+            "summary": "repaired",
+            "reasoning": "strict json re-ask fallback repair",
+            "configured": True,
+        }
+
+    monkeypatch.setattr(ask_service, "_repair_sql", fake_repair)
+
+    result = ask_service._generate_sql(
+        question="统计总销售额",
+        project_id=1,
+        semantic_context="ctx",
+        retrieved_tables=["olist_order_items_dataset"],
+        semantic_hits=_semantic_hits_models(),
+        language="zh",
+        analysis={"tier": "simple", "dimensions": [], "metrics": ["total_sales"], "entities": [], "sub_questions": []},
+    )
+
+    assert llm_calls["count"] == 2
+    assert repair_calls["count"] == 1
+    assert result["sql"] == repaired_sql
+    assert str(result.get("sql_engine") or "").endswith("_repair")
+
+
+def test_llm_chat_with_response_format_fallback_honors_cancel_before_plain_retry():
+    class FakeLLM:
+        def __init__(self):
+            self.calls = 0
+            self.config = {
+                "provider": "test",
+                "endpoint": "https://example.invalid/v1",
+                "model": "cancel-check",
+            }
+
+        def chat(self, messages, response_format="json", **kwargs):
+            self.calls += 1
+            return {"content": ""}
+
+    llm = FakeLLM()
+    breaker_key = ask_service._json_empty_content_circuit_key(llm)
+    ask_service._reset_json_empty_content_breaker(breaker_key)
+    cancel_checks = {"count": 0}
+
+    def _cancel_check() -> None:
+        cancel_checks["count"] += 1
+        if cancel_checks["count"] >= 2:
+            raise RuntimeError("cancelled")
+
+    raised: RuntimeError | None = None
+    try:
+        ask_service._llm_chat_with_response_format_fallback(
+            llm,
+            [{"role": "user", "content": "Generate SQL"}],
+            response_format="json",
+            stage="sql_generation",
+            timeout=5.0,
+            cancel_check=_cancel_check,
+        )
+    except RuntimeError as exc:
+        raised = exc
+
+    assert raised is not None
+    assert str(raised) == "cancelled"
+    assert llm.calls == 1
+
+
 def test_normalize_question_analysis_handles_non_dict_payload():
     normalized = ask_service._normalize_question_analysis(["unexpected", "payload"])  # type: ignore[arg-type]
 
@@ -1263,7 +1696,7 @@ def test_llm_schema_link_handles_non_object_json_payload():
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             return {"content": "[]"}
 
     result = ask_service._llm_schema_link(
@@ -1282,7 +1715,7 @@ def test_llm_schema_link_returns_none_on_empty_llm_content():
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             return {"content": "   "}
 
     result = ask_service._llm_schema_link(
@@ -1301,7 +1734,7 @@ def test_llm_semantic_matching_tolerates_non_string_column_items():
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             return {
                 "content": json.dumps(
                     {
@@ -1344,7 +1777,7 @@ def test_generate_sql_retries_when_llm_returns_empty_content(monkeypatch):
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             type(self).call_count += 1
             if type(self).call_count == 1:
                 return {"content": ""}
@@ -1393,7 +1826,7 @@ def test_generate_sql_uses_json_schema_response_format_when_supported(monkeypatc
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             captured["response_format"] = response_format
             return {
                 "content": json.dumps(
@@ -1453,7 +1886,7 @@ def test_classify_route_uses_json_schema_response_format_when_supported(monkeypa
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             captured["response_format"] = response_format
             return {
                 "content": json.dumps(
@@ -1494,7 +1927,7 @@ def test_generate_sql_falls_back_to_json_when_json_schema_rejected(monkeypatch):
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             calls.append(response_format)
             if isinstance(response_format, dict):
                 raise RuntimeError("response_format json_schema is unsupported")
@@ -1540,7 +1973,7 @@ def test_repair_sql_falls_back_to_json_when_json_schema_rejected(monkeypatch):
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             calls.append(response_format)
             if isinstance(response_format, dict):
                 raise RuntimeError("invalid_request_error: response_format json_schema")
@@ -1588,7 +2021,7 @@ def test_generate_sql_uses_json_when_project_not_in_route_allowlist(monkeypatch)
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             captured["response_format"] = response_format
             return {
                 "content": json.dumps(
@@ -1647,7 +2080,7 @@ def test_classify_question_route_splits_mixed_clauses_and_refines_sql_context(mo
             "score": 10 if has_hits else 0,
         }
 
-    def fake_semantic_prompt(project_id: int, q: str, require_hits: bool = False, analysis=None):
+    def fake_semantic_prompt(project_id: int, q: str, require_hits: bool = False, analysis=None, language=None):
         semantic_calls.append((q, require_hits))
         has_hits = "销售额" in q
         if not has_hits and require_hits:
@@ -1682,7 +2115,7 @@ def test_classify_question_route_splits_mixed_clauses_and_refines_sql_context(mo
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             return {
                 "content": json.dumps(
                     {
@@ -1721,7 +2154,7 @@ def test_generate_sql_includes_clause_routing_context_hint(monkeypatch):
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             captured["user_prompt"] = "\n".join(m.get("content", "") for m in messages if m.get("role") == "user")
             return {
                 "content": json.dumps(
@@ -1774,7 +2207,7 @@ def test_summarize_query_result_includes_clause_focus_hints(monkeypatch):
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             captured["user_prompt"] = "\n".join(m.get("content", "") for m in messages if m.get("role") == "user")
             return {"content": "By city, Beijing total_sales is 100."}
 
@@ -1810,7 +2243,7 @@ def test_summarize_query_result_includes_clause_focus_hints(monkeypatch):
 
     assert isinstance(summary, str)
     assert summary
-    assert "SQL-focused question part: 按城市统计销售额" in captured["user_prompt"]
+    assert "SQL-related question part: 按城市统计销售额" in captured["user_prompt"]
     assert "Non-SQL question part" in captured["user_prompt"]
     assert "Clause routing details:" in captured["user_prompt"]
 
@@ -1851,7 +2284,7 @@ def test_summarize_query_result_falls_back_when_llm_returns_thinking_trace(monke
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             return {
                 "content": (
                     "Thinking Process:\n"
@@ -1881,6 +2314,49 @@ def test_summarize_query_result_falls_back_when_llm_returns_thinking_trace(monke
     assert "结论" in summary
 
 
+def test_summarize_query_result_emits_fallback_event_on_exception(monkeypatch):
+    _patch_prompt_helpers(monkeypatch)
+    monkeypatch.setattr(ask_service, "_language_instruction", lambda *args, **kwargs: "")
+    events: list[tuple[str, dict, int | None]] = []
+
+    class FakeLLM:
+        def is_configured(self):
+            return True
+
+        def chat(self, messages, response_format="json", **kwargs):
+            raise RuntimeError("summary failed")
+
+    monkeypatch.setattr(ask_service, "LLMService", FakeLLM)
+    monkeypatch.setattr(
+        ask_service,
+        "_emit_route_event",
+        lambda event_type, payload, project_id=None: events.append((event_type, payload, project_id)),
+    )
+
+    summary = ask_service._summarize_query_result(
+        question="按城市统计销售额",
+        sql="SELECT city, SUM(amount) AS total_sales FROM orders GROUP BY city",
+        query_result={
+            "columns": ["city", "total_sales"],
+            "rows": [{"city": "Beijing", "total_sales": 100}],
+            "total_rows": 1,
+        },
+        generated_summary="ok",
+        language="en",
+        project_id=7,
+    )
+
+    assert isinstance(summary, str)
+    assert summary
+    final_answer_events = [item for item in events if item[0] == "final_answer_fallback"]
+    assert final_answer_events
+    event_type, payload, pid = final_answer_events[-1]
+    assert event_type == "final_answer_fallback"
+    assert pid == 7
+    assert payload.get("reason") == "summary_exception"
+    assert payload.get("mode") == "deterministic_row_summary"
+
+
 def test_classify_question_route_emits_clause_routing_details(monkeypatch):
     events: list[tuple[str, dict, int | None]] = []
 
@@ -1903,7 +2379,7 @@ def test_classify_question_route_emits_clause_routing_details(monkeypatch):
     monkeypatch.setattr(
         ask_service,
         "_semantic_prompt",
-        lambda _project_id, q, require_hits=False, analysis=None: (
+        lambda _project_id, q, require_hits=False, analysis=None, language=None: (
             f"semantic::{q}",
             ["orders"] if ("销售额" in q or require_hits) else [],
             {"has_hits": ("销售额" in q or require_hits), "models": [], "relations": []},
@@ -1934,7 +2410,7 @@ def test_classify_question_route_emits_clause_routing_details(monkeypatch):
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             return {
                 "content": json.dumps(
                     {
@@ -1977,7 +2453,7 @@ def test_ask_question_route_events_include_clause_summary(monkeypatch):
     monkeypatch.setattr(
         ask_service,
         "_analyze_question",
-        lambda _question, _project_id, _previous_questions=None: {
+        lambda *_args, **_kwargs: {
             "tier": "simple",
             "sub_questions": [],
             "entities": [],
@@ -2084,7 +2560,7 @@ def test_ask_question_terminal_event_marks_generation_rehint_path(monkeypatch):
     monkeypatch.setattr(
         ask_service,
         "_analyze_question",
-        lambda _question, _project_id, _previous_questions=None: {
+        lambda *_args, **_kwargs: {
             "tier": "simple",
             "sub_questions": [],
             "entities": [],
@@ -2225,7 +2701,7 @@ def test_ask_question_skips_reexecute_when_repair_sql_has_duplicate_alias(monkey
     monkeypatch.setattr(
         ask_service,
         "_analyze_question",
-        lambda _question, _project_id, _previous_questions=None: {
+        lambda *_args, **_kwargs: {
             "tier": "simple",
             "sub_questions": [],
             "entities": [],
@@ -2351,7 +2827,7 @@ def test_ask_question_skips_reexecute_when_repair_sql_has_wrong_column_owner(mon
     monkeypatch.setattr(
         ask_service,
         "_analyze_question",
-        lambda _question, _project_id, _previous_questions=None: {
+        lambda *_args, **_kwargs: {
             "tier": "simple",
             "sub_questions": [],
             "entities": [],
@@ -2467,7 +2943,7 @@ def test_general_chat_fallback_when_llm_returns_empty_content(monkeypatch):
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             return {
                 "content": "",
                 "configured": True,
@@ -2483,6 +2959,33 @@ def test_general_chat_fallback_when_llm_returns_empty_content(monkeypatch):
     assert result["content"].strip()
 
 
+def test_generate_sql_respects_total_budget_before_llm_generation(monkeypatch):
+    _patch_prompt_helpers(monkeypatch)
+    monkeypatch.setitem(ask_service.ROUTER_CONFIG, "sql_generation_total_budget_s", 0.0)
+
+    class FakeLLM:
+        def is_configured(self):
+            return True
+
+        def chat(self, messages, response_format="json", **kwargs):
+            raise AssertionError("LLM chat should not run when total generation budget is exhausted")
+
+    monkeypatch.setattr(ask_service, "LLMService", FakeLLM)
+
+    result = ask_service._generate_sql(
+        question="统计订单总数",
+        project_id=1,
+        semantic_context="ctx",
+        retrieved_tables=["olist_orders_dataset"],
+        semantic_hits=_semantic_hits_models(),
+        language="zh",
+        analysis={"tier": "simple", "dimensions": [], "metrics": ["Order Count"], "entities": [], "sub_questions": []},
+    )
+
+    assert result.get("sql") is None
+    assert result.get("sql_engine") == "llm_fallback_budget_exceeded"
+
+
 def test_temporary_ask_general_chat_uses_non_empty_fallback_summary(monkeypatch):
     monkeypatch.setattr(ask_service, "refresh_runtime_router_settings", lambda force=False: {})
     monkeypatch.setattr(ask_service, "_render_system_prompt", lambda *_args, **_kwargs: "SYSTEM")
@@ -2491,7 +2994,7 @@ def test_temporary_ask_general_chat_uses_non_empty_fallback_summary(monkeypatch)
         def is_configured(self):
             return True
 
-        def chat(self, messages, response_format="json"):
+        def chat(self, messages, response_format="json", **kwargs):
             return {
                 "content": "",
                 "configured": True,

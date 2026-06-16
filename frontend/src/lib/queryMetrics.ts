@@ -42,6 +42,41 @@ export interface StrategyObservabilitySummary {
   riskLevels: Array<[string, number]>
 }
 
+export interface RouteRepairObservabilitySummary {
+  repairShortCircuitTotal: number
+  repairLocalPreflight: number
+  repairLocalPreflightRate: number
+  repairTimeoutShortCircuit: number
+  repairTimeoutShortCircuitRate: number
+  repairBudgetLowShortCircuit: number
+  repairBudgetLowShortCircuitRate: number
+  decomposeStageTotal: number
+  decomposeStageBudgetExceeded: number
+  decomposeStageBudgetExceededRate: number
+  decomposeStageCancelled: number
+  decomposeStageCancelledRate: number
+  decomposeStageElapsedMsAvg: number
+  decomposeStageElapsedMsP50: number
+  decomposeStageElapsedMsP95: number
+  decomposeStageElapsedMsMax: number
+  jsonReaskTotal: number
+  jsonReaskRate: number
+  didYouMeanFixTotal: number
+  didYouMeanFixApplied: number
+  didYouMeanFixAppliedRate: number
+  didYouMeanStatuses: Array<[string, number]>
+}
+
+export interface RoutePathologySummary {
+  validationIssueTransitions: Array<[string, number]>
+  fallbackChainSteps: Array<[string, number]>
+  fallbackChainPatterns: Array<[string, number]>
+  repairShortCircuitIssueBuckets: Array<[string, number]>
+  repairShortCircuitDominantIssueBuckets: Array<[string, number]>
+  repairIssueBucketStreakMax: number
+  repairCircuitableIssueBucketStreakMax: number
+}
+
 export interface StrategyTrendPoint {
   capturedAtMs: number
   decisionTotal: number
@@ -71,6 +106,10 @@ export interface RouteObservabilityAlert {
     | 'repair_guard_blocked'
     | 'llm_empty_response_retry'
     | 'repair_short_circuit_low'
+    | 'repair_timeout_short_circuit_high'
+    | 'repair_budget_low_short_circuit_high'
+    | 'json_reask_high'
+    | 'decompose_cancelled_high'
     | 'llm_http_circuit_open'
     | 'schema_link_fallback_high'
     | 'sql_generation_fallback_high'
@@ -266,6 +305,126 @@ export function aggregateQueryMetrics(rows: QueryMetricsRow[]): QueryMetricsSumm
   }
 }
 
+export function summarizeRouteRepairObservability(
+  routeDimensions: QueryRouteDimensions | null | undefined,
+): RouteRepairObservabilitySummary {
+  const generationDecisionTotal = Math.max(
+    toSafeCount(routeDimensions?.generation_decision_total),
+    sumCounterValues(routeDimensions?.generation_engine),
+  )
+  const repairShortCircuitTotal = Math.max(
+    toSafeCount(routeDimensions?.repair_short_circuit),
+    sumCounterValues(routeDimensions?.repair_short_circuit_reason),
+  )
+  const repairLocalPreflight = Math.min(
+    repairShortCircuitTotal,
+    toSafeCount(routeDimensions?.repair_short_circuit_reason?.local_preflight),
+  )
+  const repairTimeoutShortCircuit = Math.min(
+    repairShortCircuitTotal,
+    toSafeCount(routeDimensions?.repair_short_circuit_reason?.repair_timeout),
+  )
+  const repairBudgetLowShortCircuit = Math.min(
+    repairShortCircuitTotal,
+    toSafeCount(routeDimensions?.repair_short_circuit_reason?.repair_budget_low),
+  )
+  const decomposeStageTotal = Math.max(
+    toSafeCount(routeDimensions?.decompose_stage_total),
+    sumCounterValues(routeDimensions?.decompose_stage_status),
+  )
+  const decomposeStageBudgetExceeded = Math.min(
+    decomposeStageTotal,
+    Math.max(
+      toSafeCount(routeDimensions?.decompose_stage_budget_exceeded),
+      toSafeCount(routeDimensions?.decompose_stage_reason?.budget_exceeded),
+    ),
+  )
+  const decomposeStageCancelled = Math.min(
+    decomposeStageTotal,
+    Math.max(
+      toSafeCount(routeDimensions?.decompose_stage_reason?.cancelled),
+      toSafeCount(routeDimensions?.decompose_stage_reason?.canceled),
+    ),
+  )
+  const decomposeStageElapsedMsAvg = round2(Math.max(0, toFiniteNumber(routeDimensions?.decompose_stage_elapsed_ms_avg)))
+  const decomposeStageElapsedMsMax = round2(Math.max(0, toFiniteNumber(routeDimensions?.decompose_stage_elapsed_ms_max)))
+  const jsonReaskTotal = toSafeCount(routeDimensions?.generation_retry_reason?.json_reask)
+
+  const payloadP50 = Math.max(0, toFiniteNumber(routeDimensions?.decompose_stage_elapsed_ms_p50))
+  const payloadP95 = Math.max(0, toFiniteNumber(routeDimensions?.decompose_stage_elapsed_ms_p95))
+  const decomposeStageElapsedMsP50 = round2(payloadP50 > 0 ? payloadP50 : decomposeStageElapsedMsAvg)
+  const decomposeStageElapsedMsP95 = round2(
+    payloadP95 > 0
+      ? payloadP95
+      : Math.max(decomposeStageElapsedMsP50, decomposeStageElapsedMsAvg, decomposeStageElapsedMsMax),
+  )
+
+  const didYouMeanFixTotal = Math.max(
+    toSafeCount(routeDimensions?.duckdb_did_you_mean_fix_total),
+    sumCounterValues(routeDimensions?.duckdb_did_you_mean_fix_status),
+  )
+  const didYouMeanFixApplied = Math.min(
+    didYouMeanFixTotal,
+    Math.max(
+      toSafeCount(routeDimensions?.duckdb_did_you_mean_fix_applied),
+      toSafeCount(routeDimensions?.duckdb_did_you_mean_fix_status?.applied),
+    ),
+  )
+
+  return {
+    repairShortCircuitTotal,
+    repairLocalPreflight,
+    repairLocalPreflightRate: repairShortCircuitTotal > 0
+      ? toSafeRate(repairLocalPreflight / repairShortCircuitTotal)
+      : 0,
+    repairTimeoutShortCircuit,
+    repairTimeoutShortCircuitRate: repairShortCircuitTotal > 0
+      ? toSafeRate(repairTimeoutShortCircuit / repairShortCircuitTotal)
+      : 0,
+    repairBudgetLowShortCircuit,
+    repairBudgetLowShortCircuitRate: repairShortCircuitTotal > 0
+      ? toSafeRate(repairBudgetLowShortCircuit / repairShortCircuitTotal)
+      : 0,
+    decomposeStageTotal,
+    decomposeStageBudgetExceeded,
+    decomposeStageBudgetExceededRate: decomposeStageTotal > 0
+      ? toSafeRate(decomposeStageBudgetExceeded / decomposeStageTotal)
+      : 0,
+    decomposeStageCancelled,
+    decomposeStageCancelledRate: decomposeStageTotal > 0
+      ? toSafeRate(decomposeStageCancelled / decomposeStageTotal)
+      : 0,
+    decomposeStageElapsedMsAvg,
+    decomposeStageElapsedMsP50,
+    decomposeStageElapsedMsP95,
+    decomposeStageElapsedMsMax,
+    jsonReaskTotal,
+    jsonReaskRate: generationDecisionTotal > 0
+      ? toSafeRate(jsonReaskTotal / generationDecisionTotal)
+      : 0,
+    didYouMeanFixTotal,
+    didYouMeanFixApplied,
+    didYouMeanFixAppliedRate: didYouMeanFixTotal > 0 ? toSafeRate(didYouMeanFixApplied / didYouMeanFixTotal) : 0,
+    didYouMeanStatuses: sortedCounterEntries(routeDimensions?.duckdb_did_you_mean_fix_status, 3),
+  }
+}
+
+export function summarizeRoutePathologies(
+  routeDimensions: QueryRouteDimensions | null | undefined,
+): RoutePathologySummary {
+  return {
+    validationIssueTransitions: sortedCounterEntries(routeDimensions?.validation_issue_bucket_transition, 4),
+    fallbackChainSteps: sortedCounterEntries(routeDimensions?.generation_fallback_chain_step, 4),
+    fallbackChainPatterns: sortedCounterEntries(routeDimensions?.generation_fallback_chain_pattern, 3),
+    repairShortCircuitIssueBuckets: sortedCounterEntries(routeDimensions?.repair_short_circuit_issue_bucket, 3),
+    repairShortCircuitDominantIssueBuckets: sortedCounterEntries(routeDimensions?.repair_short_circuit_dominant_issue_bucket, 3),
+    repairIssueBucketStreakMax: toSafeCount(routeDimensions?.repair_short_circuit_issue_bucket_streak_max),
+    repairCircuitableIssueBucketStreakMax: toSafeCount(
+      routeDimensions?.repair_short_circuit_circuitable_issue_bucket_streak_max,
+    ),
+  }
+}
+
 export function evaluateRouteObservabilityAlerts(
   routeDimensions: QueryRouteDimensions | null | undefined,
   llmHttpCircuit: QueryLLMHttpCircuitSnapshot | null | undefined = undefined,
@@ -303,6 +462,13 @@ export function evaluateRouteObservabilityAlerts(
     toSafeCount(routeDimensions?.strategy_policy?.risk_decompose_merge),
     toSafeCount(routeDimensions?.strategy_policy?.decompose_merge),
   )
+  const routeRepairSummary = summarizeRouteRepairObservability(routeDimensions)
+  const jsonReaskTotal = routeRepairSummary.jsonReaskTotal
+  const decomposeStageCancelledTotal = routeRepairSummary.decomposeStageCancelled
+  const decomposeStageTotal = routeRepairSummary.decomposeStageTotal
+  const repairShortCircuitTotal = routeRepairSummary.repairShortCircuitTotal
+  const repairTimeoutShortCircuitTotal = routeRepairSummary.repairTimeoutShortCircuit
+  const repairBudgetLowShortCircuitTotal = routeRepairSummary.repairBudgetLowShortCircuit
 
   const alerts: RouteObservabilityAlert[] = []
 
@@ -353,6 +519,193 @@ export function evaluateRouteObservabilityAlerts(
         level: 'warning',
         count: repairShortCircuitCount,
         threshold: warningThreshold,
+      })
+    }
+  }
+
+  const configuredRepairTimeoutWarningRate = toSafeRate(
+    routeDimensions?.route_alert_repair_timeout_short_circuit_warning_rate,
+  )
+  const configuredRepairTimeoutCriticalRate = toSafeRate(
+    routeDimensions?.route_alert_repair_timeout_short_circuit_critical_rate,
+  )
+  const repairTimeoutWarningRate = configuredRepairTimeoutWarningRate > 0
+    ? configuredRepairTimeoutWarningRate
+    : 0.25
+  const repairTimeoutCriticalRate = Math.max(
+    repairTimeoutWarningRate,
+    configuredRepairTimeoutCriticalRate > 0 ? configuredRepairTimeoutCriticalRate : 0.45,
+  )
+  const repairTimeoutMinWarningEvents = Math.max(
+    1,
+    toSafeCount(routeDimensions?.route_alert_repair_timeout_short_circuit_min_warning_events || 6),
+  )
+  const repairTimeoutMinCriticalEvents = Math.max(
+    repairTimeoutMinWarningEvents,
+    toSafeCount(
+      routeDimensions?.route_alert_repair_timeout_short_circuit_min_critical_events || 12,
+    ),
+  )
+
+  const configuredRepairBudgetWarningRate = toSafeRate(
+    routeDimensions?.route_alert_repair_budget_low_short_circuit_warning_rate,
+  )
+  const configuredRepairBudgetCriticalRate = toSafeRate(
+    routeDimensions?.route_alert_repair_budget_low_short_circuit_critical_rate,
+  )
+  const repairBudgetWarningRate = configuredRepairBudgetWarningRate > 0
+    ? configuredRepairBudgetWarningRate
+    : 0.2
+  const repairBudgetCriticalRate = Math.max(
+    repairBudgetWarningRate,
+    configuredRepairBudgetCriticalRate > 0 ? configuredRepairBudgetCriticalRate : 0.35,
+  )
+  const repairBudgetMinWarningEvents = Math.max(
+    1,
+    toSafeCount(routeDimensions?.route_alert_repair_budget_low_short_circuit_min_warning_events || 6),
+  )
+  const repairBudgetMinCriticalEvents = Math.max(
+    repairBudgetMinWarningEvents,
+    toSafeCount(
+      routeDimensions?.route_alert_repair_budget_low_short_circuit_min_critical_events || 12,
+    ),
+  )
+
+  if (repairShortCircuitTotal >= repairTimeoutMinWarningEvents) {
+    const repairTimeoutWarningThreshold = Math.max(1, Math.ceil(repairShortCircuitTotal * repairTimeoutWarningRate))
+    const repairTimeoutCriticalThreshold = Math.max(
+      repairTimeoutWarningThreshold + 1,
+      Math.ceil(repairShortCircuitTotal * repairTimeoutCriticalRate),
+    )
+    if (repairShortCircuitTotal >= repairTimeoutMinCriticalEvents && repairTimeoutShortCircuitTotal >= repairTimeoutCriticalThreshold) {
+      alerts.push({
+        id: 'repair_timeout_short_circuit_high',
+        level: 'critical',
+        count: repairTimeoutShortCircuitTotal,
+        threshold: repairTimeoutCriticalThreshold,
+      })
+    } else if (repairTimeoutShortCircuitTotal >= repairTimeoutWarningThreshold) {
+      alerts.push({
+        id: 'repair_timeout_short_circuit_high',
+        level: 'warning',
+        count: repairTimeoutShortCircuitTotal,
+        threshold: repairTimeoutWarningThreshold,
+      })
+    }
+  }
+
+  if (repairShortCircuitTotal >= repairBudgetMinWarningEvents) {
+    const repairBudgetWarningThreshold = Math.max(1, Math.ceil(repairShortCircuitTotal * repairBudgetWarningRate))
+    const repairBudgetCriticalThreshold = Math.max(
+      repairBudgetWarningThreshold + 1,
+      Math.ceil(repairShortCircuitTotal * repairBudgetCriticalRate),
+    )
+    if (repairShortCircuitTotal >= repairBudgetMinCriticalEvents && repairBudgetLowShortCircuitTotal >= repairBudgetCriticalThreshold) {
+      alerts.push({
+        id: 'repair_budget_low_short_circuit_high',
+        level: 'critical',
+        count: repairBudgetLowShortCircuitTotal,
+        threshold: repairBudgetCriticalThreshold,
+      })
+    } else if (repairBudgetLowShortCircuitTotal >= repairBudgetWarningThreshold) {
+      alerts.push({
+        id: 'repair_budget_low_short_circuit_high',
+        level: 'warning',
+        count: repairBudgetLowShortCircuitTotal,
+        threshold: repairBudgetWarningThreshold,
+      })
+    }
+  }
+
+  const configuredJsonReaskWarningRate = toSafeRate(
+    routeDimensions?.route_alert_json_reask_warning_rate,
+  )
+  const configuredJsonReaskCriticalRate = toSafeRate(
+    routeDimensions?.route_alert_json_reask_critical_rate,
+  )
+  const jsonReaskWarningRate = configuredJsonReaskWarningRate > 0
+    ? configuredJsonReaskWarningRate
+    : 0.2
+  const jsonReaskCriticalRate = Math.max(
+    jsonReaskWarningRate,
+    configuredJsonReaskCriticalRate > 0 ? configuredJsonReaskCriticalRate : 0.4,
+  )
+  const jsonReaskMinWarningDecisions = Math.max(
+    1,
+    toSafeCount(routeDimensions?.route_alert_json_reask_min_warning_decisions || 10),
+  )
+  const jsonReaskMinCriticalDecisions = Math.max(
+    jsonReaskMinWarningDecisions,
+    toSafeCount(routeDimensions?.route_alert_json_reask_min_critical_decisions || 20),
+  )
+
+  if (generationDecisionTotal >= jsonReaskMinWarningDecisions) {
+    const jsonReaskWarningThreshold = Math.max(1, Math.ceil(generationDecisionTotal * jsonReaskWarningRate))
+    const jsonReaskCriticalThreshold = Math.max(
+      jsonReaskWarningThreshold + 1,
+      Math.ceil(generationDecisionTotal * jsonReaskCriticalRate),
+    )
+    if (generationDecisionTotal >= jsonReaskMinCriticalDecisions && jsonReaskTotal >= jsonReaskCriticalThreshold) {
+      alerts.push({
+        id: 'json_reask_high',
+        level: 'critical',
+        count: jsonReaskTotal,
+        threshold: jsonReaskCriticalThreshold,
+      })
+    } else if (jsonReaskTotal >= jsonReaskWarningThreshold) {
+      alerts.push({
+        id: 'json_reask_high',
+        level: 'warning',
+        count: jsonReaskTotal,
+        threshold: jsonReaskWarningThreshold,
+      })
+    }
+  }
+
+  const configuredDecomposeCancelledWarningRate = toSafeRate(
+    routeDimensions?.route_alert_decompose_cancelled_warning_rate,
+  )
+  const configuredDecomposeCancelledCriticalRate = toSafeRate(
+    routeDimensions?.route_alert_decompose_cancelled_critical_rate,
+  )
+  const decomposeCancelledWarningRate = configuredDecomposeCancelledWarningRate > 0
+    ? configuredDecomposeCancelledWarningRate
+    : 0.15
+  const decomposeCancelledCriticalRate = Math.max(
+    decomposeCancelledWarningRate,
+    configuredDecomposeCancelledCriticalRate > 0 ? configuredDecomposeCancelledCriticalRate : 0.3,
+  )
+  const decomposeCancelledMinWarningEvents = Math.max(
+    1,
+    toSafeCount(routeDimensions?.route_alert_decompose_cancelled_min_warning_events || 6),
+  )
+  const decomposeCancelledMinCriticalEvents = Math.max(
+    decomposeCancelledMinWarningEvents,
+    toSafeCount(routeDimensions?.route_alert_decompose_cancelled_min_critical_events || 12),
+  )
+
+  if (decomposeStageTotal >= decomposeCancelledMinWarningEvents) {
+    const decomposeCancelledWarningThreshold = Math.max(
+      1,
+      Math.ceil(decomposeStageTotal * decomposeCancelledWarningRate),
+    )
+    const decomposeCancelledCriticalThreshold = Math.max(
+      decomposeCancelledWarningThreshold + 1,
+      Math.ceil(decomposeStageTotal * decomposeCancelledCriticalRate),
+    )
+    if (decomposeStageTotal >= decomposeCancelledMinCriticalEvents && decomposeStageCancelledTotal >= decomposeCancelledCriticalThreshold) {
+      alerts.push({
+        id: 'decompose_cancelled_high',
+        level: 'critical',
+        count: decomposeStageCancelledTotal,
+        threshold: decomposeCancelledCriticalThreshold,
+      })
+    } else if (decomposeStageCancelledTotal >= decomposeCancelledWarningThreshold) {
+      alerts.push({
+        id: 'decompose_cancelled_high',
+        level: 'warning',
+        count: decomposeStageCancelledTotal,
+        threshold: decomposeCancelledWarningThreshold,
       })
     }
   }

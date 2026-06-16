@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
+import time
 import uuid
 from urllib.parse import unquote
 
@@ -12,59 +12,23 @@ from pydantic import ValidationError
 from starlette.websockets import WebSocketState
 
 from models.schemas import AskRequest
-from routers.ask import _ask_project_id
+from routers.ask import (
+    _ask_project_id,
+    _chunk_text,
+    _STREAM_FLUSH_SECONDS,
+    _STREAM_RUNNING_HEARTBEAT_SECONDS,
+    _stream_heartbeat_interval,
+    _stream_result_payload,
+)
 from routers.auth import get_payload_from_token, payload_has_permission, consume_ws_ticket
 from services.ask_idempotency import acquire_ask_idempotency
 from services.ask_service import AskCancelledError, ask_question as run_ask_question
-from services.step_progress import StepProgress, _STEP_KEYS
+from services.step_progress import StepProgress
 
 LOGGER = logging.getLogger(__name__)
 
 _MAX_MSG_SIZE = 256 * 1024
 
-
-def _coerce_stream_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
-    raw = os.getenv(name)
-    try:
-        value = int(raw) if raw is not None else int(default)
-    except Exception:
-        value = int(default)
-    if value < minimum:
-        return minimum
-    if value > maximum:
-        return maximum
-    return value
-
-
-_STREAM_MIN_CHARS = _coerce_stream_int_env("PRISMBI_ASK_STREAM_MIN_CHARS", 48, 20, 400)
-_STREAM_MAX_CHARS = _coerce_stream_int_env("PRISMBI_ASK_STREAM_MAX_CHARS", 80, 20, 800)
-if _STREAM_MAX_CHARS < _STREAM_MIN_CHARS:
-    _STREAM_MAX_CHARS = _STREAM_MIN_CHARS
-_STREAM_FLUSH_MS = _coerce_stream_int_env("PRISMBI_ASK_STREAM_FLUSH_MS", 40, 0, 2000)
-_STREAM_FLUSH_SECONDS = float(_STREAM_FLUSH_MS) / 1000.0
-_CHUNK_BOUNDARY_CHARS = frozenset(
-    {
-        " ",
-        "\n",
-        "\t",
-        ",",
-        ".",
-        ";",
-        ":",
-        "!",
-        "?",
-        ")",
-        "]",
-        "}",
-        "\uFF0C",
-        "\u3002",
-        "\uFF1B",
-        "\uFF1A",
-        "\uFF01",
-        "\uFF1F",
-        "\u3001",
-    }
-)
 
 router = APIRouter()
 
@@ -197,27 +161,6 @@ def _parse_ws_data(raw: object) -> dict:
     return raw
 
 
-def _chunk_text(text: str, min_chars: int = _STREAM_MIN_CHARS, max_chars: int = _STREAM_MAX_CHARS) -> list[str]:
-    if not text:
-        return []
-    normalized_min = max(1, int(min_chars))
-    normalized_max = max(normalized_min, int(max_chars))
-    chunks: list[str] = []
-    buffer: list[str] = []
-    for ch in text:
-        buffer.append(ch)
-        length = len(buffer)
-        should_flush = length >= normalized_max
-        if not should_flush and length >= normalized_min and ch in _CHUNK_BOUNDARY_CHARS:
-            should_flush = True
-        if should_flush:
-            chunks.append("".join(buffer))
-            buffer = []
-    if buffer:
-        chunks.append("".join(buffer))
-    return chunks
-
-
 @router.websocket("/ask")
 async def websocket_ask(websocket: WebSocket):
     raw_token, raw_ticket = _resolve_ws_auth_inputs(websocket)
@@ -235,27 +178,62 @@ async def websocket_ask(websocket: WebSocket):
     write_lock = asyncio.Lock()
     active_ask: dict[str, asyncio.Task] = {}
 
-    async def _send_step_deltas(step_queue: asyncio.Queue, request_id: str) -> None:
+    async def _send_step_deltas(step_queue: asyncio.Queue, request_id: str, ask_started_at: float, enrich_payload=None) -> None:
+        last_running_emit_at = time.monotonic()
         while True:
             try:
                 step = await asyncio.wait_for(step_queue.get(), timeout=0.1)
             except asyncio.TimeoutError:
+                now = time.monotonic()
+                heartbeat_interval = _stream_heartbeat_interval(now - ask_started_at)
+                if heartbeat_interval > 0 and (now - last_running_emit_at) >= heartbeat_interval:
+                    running_payload = {
+                        "type": "delta",
+                        "content_type": "state",
+                        "content": "running",
+                        "request_id": request_id or None,
+                    }
+                    if enrich_payload is not None:
+                        running_payload = enrich_payload(running_payload)
+                    try:
+                        await _send_json_safe(websocket, running_payload, write_lock)
+                        last_running_emit_at = now
+                    except Exception:
+                        break
                 continue
             except asyncio.CancelledError:
                 break
             if step is None:
                 break
-            await _send_json_safe(websocket, {
+            step_payload = {
                 "type": "delta",
                 "content_type": "step",
                 "content": json.dumps(step),
                 "request_id": request_id or None,
-            }, write_lock)
+            }
+            if enrich_payload is not None:
+                step_payload = enrich_payload(step_payload)
+            try:
+                await _send_json_safe(websocket, step_payload, write_lock)
+            except Exception:
+                break
 
     async def _process_ask(body: AskRequest, request_id: str) -> None:
         client_request_id = body.client_request_id or request_id
+        ask_started_at = time.monotonic()
+        seq = 0
+
+        def _with_stream_meta(payload: dict) -> dict:
+            nonlocal seq
+            seq += 1
+            enriched = dict(payload)
+            enriched["seq"] = seq
+            enriched["ts"] = int(time.time() * 1000)
+            enriched["elapsed_ms"] = int(max(0.0, (time.monotonic() - ask_started_at) * 1000.0))
+            return enriched
+
         LOGGER.info(
-            "Ask WS start request_id=%s thread_id=%s client_request_id=%s",
+            "Ask transport start transport=ws request_id=%s thread_id=%s client_request_id=%s",
             request_id,
             body.thread_id,
             client_request_id,
@@ -271,7 +249,7 @@ async def websocket_ask(websocket: WebSocket):
         )
         disconnected = False
         step_queue: asyncio.Queue = asyncio.Queue(maxsize=50)
-        step_sender = asyncio.create_task(_send_step_deltas(step_queue, request_id))
+        step_sender = asyncio.create_task(_send_step_deltas(step_queue, request_id, ask_started_at, _with_stream_meta))
         progress_cb = StepProgress(asyncio.get_running_loop(), step_queue)
 
         def _run_owner_ask() -> dict:
@@ -284,15 +262,26 @@ async def websocket_ask(websocket: WebSocket):
             return result
 
         try:
-            _require_ws_ask_permission(body, payload)
-
-            await _send_json_safe(websocket, {"type": "delta", "content_type": "state", "content": "running", "request_id": request_id or None}, write_lock)
+            await _send_json_safe(
+                websocket,
+                _with_stream_meta(
+                    {
+                        "type": "delta",
+                        "content_type": "state",
+                        "content": "running",
+                        "request_id": request_id or None,
+                    }
+                ),
+                write_lock,
+            )
 
             loop = asyncio.get_running_loop()
             if handle.is_owner:
                 result = await loop.run_in_executor(None, _run_owner_ask)
             else:
                 result = await loop.run_in_executor(None, handle.wait_result)
+            await progress_cb.flush_async(timeout=0.25)
+            result_payload = _stream_result_payload(result, temporary=bool(body.temporary))
 
             answer = result.get("summary", "") or ""
             sql = result.get("sql", "") or ""
@@ -302,19 +291,52 @@ async def websocket_ask(websocket: WebSocket):
                 for i, chunk in enumerate(chunks):
                     if websocket.client_state != WebSocketState.CONNECTED:
                         break
-                    await _send_json_safe(websocket, {"type": "delta", "content_type": "text", "content": chunk, "request_id": request_id or None}, write_lock)
+                    await _send_json_safe(
+                        websocket,
+                        _with_stream_meta(
+                            {
+                                "type": "delta",
+                                "content_type": "text",
+                                "content": chunk,
+                                "request_id": request_id or None,
+                            }
+                        ),
+                        write_lock,
+                    )
                     if i < len(chunks) - 1 and _STREAM_FLUSH_SECONDS > 0:
                         await asyncio.sleep(_STREAM_FLUSH_SECONDS)
 
             if sql:
-                await _send_json_safe(websocket, {"type": "delta", "content_type": "sql", "content": sql, "request_id": request_id or None}, write_lock)
+                await _send_json_safe(
+                    websocket,
+                    _with_stream_meta(
+                        {
+                            "type": "delta",
+                            "content_type": "sql",
+                            "content": sql,
+                            "request_id": request_id or None,
+                        }
+                    ),
+                    write_lock,
+                )
 
-            await _send_json_safe(websocket, {"type": "result", "data": result, "request_id": request_id or None}, write_lock)
+            await _send_json_safe(
+                websocket,
+                _with_stream_meta(
+                    {
+                        "type": "result",
+                        "data": result_payload,
+                        "request_id": request_id or None,
+                    }
+                ),
+                write_lock,
+            )
             LOGGER.info(
-                "Ask WS completed request_id=%s thread_id=%s client_request_id=%s",
+                "Ask transport completed transport=ws request_id=%s thread_id=%s client_request_id=%s compact=%s",
                 request_id,
                 body.thread_id,
                 client_request_id,
+                bool(result_payload.get("compact_result")),
             )
         except asyncio.CancelledError:
             disconnected = True
@@ -328,29 +350,52 @@ async def websocket_ask(websocket: WebSocket):
         except Exception as exc:
             if isinstance(exc, AskCancelledError):
                 LOGGER.warning(
-                    "Ask WS cancelled by backend request_id=%s thread_id=%s client_request_id=%s",
+                    "Ask transport cancelled transport=ws request_id=%s thread_id=%s client_request_id=%s",
                     request_id,
                     body.thread_id,
                     client_request_id,
                 )
                 if websocket.client_state == WebSocketState.CONNECTED:
-                    await _send_json_safe(websocket, {"type": "error", "message": "Ask request cancelled", "request_id": request_id or None}, write_lock)
+                    await _send_json_safe(
+                        websocket,
+                        _with_stream_meta(
+                            {
+                                "type": "error",
+                                "message": "Ask request cancelled",
+                                "request_id": request_id or None,
+                            }
+                        ),
+                        write_lock,
+                    )
             else:
                 LOGGER.exception(
-                    "Ask WS failed request_id=%s thread_id=%s client_request_id=%s",
+                    "Ask transport failed transport=ws request_id=%s thread_id=%s client_request_id=%s",
                     request_id,
                     body.thread_id,
                     client_request_id,
                 )
                 if websocket.client_state == WebSocketState.CONNECTED:
-                    await _send_json_safe(websocket, {"type": "error", "message": "Ask execution failed", "request_id": request_id or None}, write_lock)
+                    await _send_json_safe(
+                        websocket,
+                        _with_stream_meta(
+                            {
+                                "type": "error",
+                                "message": "Ask execution failed",
+                                "request_id": request_id or None,
+                            }
+                        ),
+                        write_lock,
+                    )
         finally:
             await step_queue.put(None)
-            step_sender.cancel()
             try:
-                await step_sender
-            except asyncio.CancelledError:
-                pass
+                await asyncio.wait_for(step_sender, timeout=0.5)
+            except asyncio.TimeoutError:
+                step_sender.cancel()
+                try:
+                    await step_sender
+                except asyncio.CancelledError:
+                    pass
             handle.release(disconnected=disconnected or websocket.client_state != WebSocketState.CONNECTED)
             LOGGER.info(
                 "Ask WS released request_id=%s thread_id=%s client_request_id=%s disconnected=%s",
@@ -411,7 +456,7 @@ async def websocket_ask(websocket: WebSocket):
                 continue
 
             LOGGER.info(
-                "Ask WS accepted request_id=%s thread_id=%s client_request_id=%s",
+                "Ask transport accepted transport=ws request_id=%s thread_id=%s client_request_id=%s",
                 request_id,
                 body.thread_id,
                 body.client_request_id,

@@ -668,6 +668,38 @@ def test_apply_group_by_aggregation_rewrite_rules_wraps_non_grouped_order_and_ha
     assert _validate_sql_aggregation(rewritten_sql) == []
 
 
+def test_apply_group_by_aggregation_rewrite_rules_removes_aggregate_alias_from_group_by():
+    sql = (
+        "SELECT oi.product_id, SUM(oi.price) AS total_sales "
+        "FROM olist_order_items_dataset oi "
+        "GROUP BY oi.product_id, total_sales"
+    )
+
+    rewritten_sql, rewrite_notes = _apply_group_by_aggregation_rewrite_rules(sql)
+
+    assert rewritten_sql != sql
+    lowered = rewritten_sql.lower()
+    assert "group by oi.product_id, total_sales" not in lowered
+    assert "group by oi.product_id" in lowered
+    assert any("aggregate alias" in note for note in rewrite_notes)
+
+
+def test_apply_group_by_aggregation_rewrite_rules_removes_aggregate_expression_from_group_by():
+    sql = (
+        "SELECT oi.product_id, SUM(oi.price) AS total_sales "
+        "FROM olist_order_items_dataset oi "
+        "GROUP BY oi.product_id, SUM(oi.price)"
+    )
+
+    rewritten_sql, rewrite_notes = _apply_group_by_aggregation_rewrite_rules(sql)
+
+    assert rewritten_sql != sql
+    lowered = rewritten_sql.lower()
+    assert "group by oi.product_id" in lowered
+    assert "sum(oi.price)" not in lowered.split("group by", 1)[-1]
+    assert any("aggregate expression" in note for note in rewrite_notes)
+
+
 def test_normalize_sql_text_converts_fullwidth_punctuation_outside_literals():
     sql = "SELECT 'Ａ，Ｂ' AS label， city FROM orders WHERE note='x；y'；"
 
@@ -837,6 +869,26 @@ def test_owner_selector_rules_rehints_using_preferred_owner():
     schema_link_plan = {"selected_owner_map": {"customer_id": "olist_orders_dataset"}}
     rewritten = _apply_owner_selector_rules(sql, models, bad_columns=bad_columns, schema_link_plan=schema_link_plan)
     assert "o.customer_id" in rewritten
+
+
+def test_owner_selector_rules_prefers_owner_already_in_query_tables_when_ambiguous():
+    models = [
+        {
+            "name": "olist_order_items_dataset",
+            "table_reference": "olist_order_items_dataset",
+            "columns": [{"name": "order_id"}],
+        },
+        {
+            "name": "olist_orders_dataset",
+            "table_reference": "olist_orders_dataset",
+            "columns": [{"name": "order_id"}, {"name": "customer_id"}],
+        },
+    ]
+    sql = "SELECT t3.order_id FROM olist_orders_dataset o"
+    bad_columns = ["t3.order_id (belongs on: olist_order_items_dataset, olist_orders_dataset)"]
+    rewritten = _apply_owner_selector_rules(sql, models, bad_columns=bad_columns, schema_link_plan=None)
+    assert "o.order_id" in rewritten
+    assert "t3.order_id" not in rewritten
 
 
 def test_group_by_completion_rules_adds_missing_non_aggregated_column():

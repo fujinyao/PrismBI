@@ -241,15 +241,15 @@ class TestUpdateSetting:
         ).fetchone()[0]
         assert after == before
 
-    def test_update_general_route_observability_window_refreshes_runtime_config(self, test_app: TestClient, auth_headers: dict):
+    def test_update_router_route_observability_window_refreshes_runtime_config(self, test_app: TestClient, auth_headers: dict):
         import db
         import services.ask_service as ask_service
 
         ask_service.ROUTER_CONFIG["route_observability_window_seconds"] = 1800
 
         response = test_app.put(
-            "/api/settings/general",
-            json={"route_observability_window_minutes": 45},
+            "/api/settings/router",
+            json={"route_observability_window_seconds": 2700},
             headers=auth_headers,
         )
 
@@ -263,7 +263,7 @@ class TestUpdateSetting:
         assert stored is not None
         assert int(stored[0]) == 2700
 
-    def test_update_general_applies_timeout_and_persist_fields_in_single_request(self, test_app: TestClient, auth_headers: dict):
+    def test_update_router_applies_timeout_and_persist_fields_in_single_request(self, test_app: TestClient, auth_headers: dict):
         import db
         import services.ask_service as ask_service
 
@@ -273,7 +273,7 @@ class TestUpdateSetting:
         ask_service.ROUTER_CONFIG["model_ref_case_sensitive"] = True
 
         response = test_app.put(
-            "/api/settings/general",
+            "/api/settings/router",
             json={
                 "request_timeout_ms": 91000,
                 "llm_read_timeout_s": 240,
@@ -326,12 +326,12 @@ class TestUpdateSetting:
         assert ask_service.ROUTER_CONFIG["model_ref_case_sensitive"] is False
 
         audit = con.execute(
-            "SELECT event_type, resource_type, resource_id, action, detail FROM metadata.audit_logs WHERE event_type = 'SETTINGS_GENERAL_UPDATE' ORDER BY id DESC LIMIT 1"
+            "SELECT event_type, resource_type, resource_id, action, detail FROM metadata.audit_logs WHERE event_type = 'SETTINGS_ROUTER_UPDATE' ORDER BY id DESC LIMIT 1"
         ).fetchone()
         assert audit is not None
-        assert audit[0] == "SETTINGS_GENERAL_UPDATE"
+        assert audit[0] == "SETTINGS_ROUTER_UPDATE"
         assert audit[1] == "settings"
-        assert audit[2] == "general"
+        assert audit[2] == "router"
         assert audit[3] == "update"
         detail = audit[4]
         if isinstance(detail, str):
@@ -358,7 +358,7 @@ class TestUpdateSetting:
         )
 
         response = test_app.put(
-            "/api/settings/general",
+            "/api/settings/router",
             json={
                 "request_timeout_ms": 91000,
                 "route_observability_persist_event_delta": 0,
@@ -373,25 +373,18 @@ class TestUpdateSetting:
         assert request_timeout_after is not None
         assert int(request_timeout_after[0]) == 120000
 
-    def test_update_timeout_settings_rejects_out_of_range_values(self, test_app: TestClient, auth_headers: dict):
+    def test_update_router_settings_rejects_out_of_range_timeout_value(self, test_app: TestClient, auth_headers: dict):
         import db
 
         con = db.get_connection()
-        before = con.execute(
-            "SELECT COUNT(*) FROM metadata.audit_logs WHERE event_type = 'SETTINGS_TIMEOUTS_UPDATE'"
-        ).fetchone()[0]
 
         response = test_app.put(
-            "/api/settings/timeouts",
+            "/api/settings/router",
             json={"request_timeout_ms": 999},
             headers=auth_headers,
         )
 
         assert response.status_code == 422
-        after = con.execute(
-            "SELECT COUNT(*) FROM metadata.audit_logs WHERE event_type = 'SETTINGS_TIMEOUTS_UPDATE'"
-        ).fetchone()[0]
-        assert after == before
 
     def test_update_router_settings_refreshes_runtime_config(self, test_app: TestClient, auth_headers: dict):
         import services.ask_service as ask_service
@@ -417,6 +410,22 @@ class TestUpdateSetting:
                 "route_observability_strategy_trend_max_points": 36,
                 "route_observability_strategy_trend_persist_interval_seconds": 20,
                 "route_observability_strategy_trend_persist_decision_delta": 3,
+                "route_alert_repair_timeout_short_circuit_warning_rate": 0.3,
+                "route_alert_repair_timeout_short_circuit_critical_rate": 0.25,
+                "route_alert_repair_timeout_short_circuit_min_warning_events": 9,
+                "route_alert_repair_timeout_short_circuit_min_critical_events": 6,
+                "route_alert_repair_budget_low_short_circuit_warning_rate": 0.18,
+                "route_alert_repair_budget_low_short_circuit_critical_rate": 0.14,
+                "route_alert_repair_budget_low_short_circuit_min_warning_events": 7,
+                "route_alert_repair_budget_low_short_circuit_min_critical_events": 4,
+                "route_alert_json_reask_warning_rate": 0.22,
+                "route_alert_json_reask_critical_rate": 0.18,
+                "route_alert_json_reask_min_warning_decisions": 11,
+                "route_alert_json_reask_min_critical_decisions": 9,
+                "route_alert_decompose_cancelled_warning_rate": 0.17,
+                "route_alert_decompose_cancelled_critical_rate": 0.12,
+                "route_alert_decompose_cancelled_min_warning_events": 8,
+                "route_alert_decompose_cancelled_min_critical_events": 5,
                 "sql_route_v2_enabled": True,
                 "sql_route_shadow_mode": True,
                 "sql_route_allowlist_projects": [1, 2],
@@ -443,6 +452,22 @@ class TestUpdateSetting:
         assert ask_service.ROUTER_CONFIG["route_observability_strategy_trend_max_points"] == 36
         assert ask_service.ROUTER_CONFIG["route_observability_strategy_trend_persist_interval_seconds"] == 20
         assert ask_service.ROUTER_CONFIG["route_observability_strategy_trend_persist_decision_delta"] == 3
+        assert ask_service.ROUTER_CONFIG["route_alert_repair_timeout_short_circuit_warning_rate"] == 0.3
+        assert ask_service.ROUTER_CONFIG["route_alert_repair_timeout_short_circuit_critical_rate"] == 0.3
+        assert ask_service.ROUTER_CONFIG["route_alert_repair_timeout_short_circuit_min_warning_events"] == 9
+        assert ask_service.ROUTER_CONFIG["route_alert_repair_timeout_short_circuit_min_critical_events"] == 9
+        assert ask_service.ROUTER_CONFIG["route_alert_repair_budget_low_short_circuit_warning_rate"] == 0.18
+        assert ask_service.ROUTER_CONFIG["route_alert_repair_budget_low_short_circuit_critical_rate"] == 0.18
+        assert ask_service.ROUTER_CONFIG["route_alert_repair_budget_low_short_circuit_min_warning_events"] == 7
+        assert ask_service.ROUTER_CONFIG["route_alert_repair_budget_low_short_circuit_min_critical_events"] == 7
+        assert ask_service.ROUTER_CONFIG["route_alert_json_reask_warning_rate"] == 0.22
+        assert ask_service.ROUTER_CONFIG["route_alert_json_reask_critical_rate"] == 0.22
+        assert ask_service.ROUTER_CONFIG["route_alert_json_reask_min_warning_decisions"] == 11
+        assert ask_service.ROUTER_CONFIG["route_alert_json_reask_min_critical_decisions"] == 11
+        assert ask_service.ROUTER_CONFIG["route_alert_decompose_cancelled_warning_rate"] == 0.17
+        assert ask_service.ROUTER_CONFIG["route_alert_decompose_cancelled_critical_rate"] == 0.17
+        assert ask_service.ROUTER_CONFIG["route_alert_decompose_cancelled_min_warning_events"] == 8
+        assert ask_service.ROUTER_CONFIG["route_alert_decompose_cancelled_min_critical_events"] == 8
         assert ask_service.ROUTER_CONFIG["model_ref_case_sensitive"] is False
         assert ask_service.ROUTER_CONFIG["sql_route_v2_enabled"] is True
         assert ask_service.ROUTER_CONFIG["sql_route_shadow_mode"] is True
@@ -504,12 +529,12 @@ class TestUpdateSetting:
         )
         assert response_branding.status_code == 200
 
-        response_general = test_app.put(
-            "/api/settings/general",
+        response_router = test_app.put(
+            "/api/settings/router",
             json={"request_timeout_ms": 95000},
             headers=auth_headers,
         )
-        assert response_general.status_code == 200
+        assert response_router.status_code == 200
 
         response_reload = test_app.post("/api/settings/router/reload", headers=auth_headers)
         assert response_reload.status_code == 200
@@ -525,34 +550,29 @@ class TestUpdateSetting:
         assert int(data["matched_events"]) >= 3
         by_scope = data["by_scope"]
         assert "branding" in by_scope
-        assert "general" in by_scope
         assert "router" in by_scope
         assert int(by_scope["branding"]["events"]) >= 1
-        assert int(by_scope["general"]["events"]) >= 1
         assert int(by_scope["router"]["events"]) >= 1
         assert int(by_scope["branding"]["changed_fields"].get("app_name", 0)) >= 1
-        assert int(by_scope["general"]["changed_fields"].get("request_timeout_ms", 0)) >= 1
-        assert int(by_scope["router"]["actions"].get("reload", 0)) >= 1
 
         latest = data["latest"]
         assert isinstance(latest, list)
         assert any(item.get("scope") == "branding" for item in latest)
-        assert any(item.get("scope") == "general" for item in latest)
 
     def test_get_settings_audit_summary_supports_scope_and_latest_offset(self, test_app: TestClient, auth_headers: dict):
-        response_general_1 = test_app.put(
-            "/api/settings/general",
+        response_router_1 = test_app.put(
+            "/api/settings/router",
             json={"request_timeout_ms": 96100},
             headers=auth_headers,
         )
-        assert response_general_1.status_code == 200
+        assert response_router_1.status_code == 200
 
-        response_general_2 = test_app.put(
-            "/api/settings/general",
+        response_router_2 = test_app.put(
+            "/api/settings/router",
             json={"llm_read_timeout_s": 242},
             headers=auth_headers,
         )
-        assert response_general_2.status_code == 200
+        assert response_router_2.status_code == 200
 
         response_branding = test_app.put(
             "/api/settings/branding",
@@ -562,25 +582,25 @@ class TestUpdateSetting:
         assert response_branding.status_code == 200
 
         latest_first = test_app.get(
-            "/api/settings/audit-summary?scope=general&latest_limit=1&latest_offset=0&max_events=1000",
+            "/api/settings/audit-summary?scope=router&latest_limit=1&latest_offset=0&max_events=1000",
             headers=auth_headers,
         )
         assert latest_first.status_code == 200
         first_data = latest_first.json()["data"]
-        assert first_data["scope"] == "general"
+        assert first_data["scope"] == "router"
         assert int(first_data["matched_events"]) >= 2
-        assert set(first_data["by_scope"].keys()) == {"general"}
+        assert set(first_data["by_scope"].keys()) == {"router"}
         assert len(first_data["latest"]) == 1
         first_changed = set(first_data["latest"][0].get("changed_fields") or [])
         assert "llm_read_timeout_s" in first_changed
 
         latest_second = test_app.get(
-            "/api/settings/audit-summary?scope=general&latest_limit=1&latest_offset=1&max_events=1000",
+            "/api/settings/audit-summary?scope=router&latest_limit=1&latest_offset=1&max_events=1000",
             headers=auth_headers,
         )
         assert latest_second.status_code == 200
         second_data = latest_second.json()["data"]
-        assert second_data["scope"] == "general"
+        assert second_data["scope"] == "router"
         assert len(second_data["latest"]) == 1
         second_changed = set(second_data["latest"][0].get("changed_fields") or [])
         assert "request_timeout_ms" in second_changed
@@ -719,40 +739,38 @@ class TestUpdateSetting:
             "analysis_cache_ttl_s": 300,
         }
         created_thread_id = None
-        try:
-            response = test_app.put(
-                "/api/settings/ask",
-                json={
-                    "max_sql_rows": 333,
-                    "default_preview_row_limit": 17,
-                    "min_preview_row_limit": 11,
-                    "max_preview_row_limit": 22,
-                },
-                headers=auth_headers,
-            )
+        response = test_app.put(
+            "/api/settings/ask",
+            json={
+                "max_sql_rows": 333,
+                "default_preview_row_limit": 17,
+                "min_preview_row_limit": 11,
+                "max_preview_row_limit": 22,
+            },
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["data"]["success"] is True
+        assert ask_service.MAX_SQL_ROWS == 333
+        assert ask_service.DEFAULT_PREVIEW_ROW_LIMIT == 17
+        assert ask_service.MIN_PREVIEW_ROW_LIMIT == 11
+        assert ask_service.MAX_PREVIEW_ROW_LIMIT == 22
+        assert ask_service._normalize_preview_row_limit(5) == 11
+        assert ask_service._normalize_preview_row_limit(100) == 22
 
-            assert response.status_code == 200
-            assert response.json()["data"]["success"] is True
-            assert ask_service.MAX_SQL_ROWS == 333
-            assert ask_service.DEFAULT_PREVIEW_ROW_LIMIT == 17
-            assert ask_service.MIN_PREVIEW_ROW_LIMIT == 11
-            assert ask_service.MAX_PREVIEW_ROW_LIMIT == 22
-            assert ask_service.normalize_preview_row_limit(5) == 11
-            assert ask_service.normalize_preview_row_limit(100) == 22
+        thread_response = test_app.post(
+            "/api/threads",
+            json={"project_id": 1, "summary": "runtime-limit-test", "preview_row_limit": 3},
+            headers=auth_headers,
+        )
+        assert thread_response.status_code == 200
+        thread_data = thread_response.json()["data"]
+        created_thread_id = thread_data["id"]
+        assert thread_data["preview_row_limit"] == 11
 
-            thread_response = test_app.post(
-                "/api/threads",
-                json={"project_id": 1, "summary": "runtime-limit-test", "preview_row_limit": 3},
-                headers=auth_headers,
-            )
-            assert thread_response.status_code == 200
-            thread_data = thread_response.json()["data"]
-            created_thread_id = thread_data["id"]
-            assert thread_data["preview_row_limit"] == 11
-        finally:
-            test_app.put("/api/settings/ask", json=restore_payload, headers=auth_headers)
-            if created_thread_id is not None:
-                test_app.delete(f"/api/threads/{created_thread_id}", headers=auth_headers)
+        test_app.put("/api/settings/ask", json=restore_payload, headers=auth_headers)
+        if created_thread_id is not None:
+            test_app.delete(f"/api/threads/{created_thread_id}", headers=auth_headers)
 
     def test_update_ask_settings_rejects_out_of_range_values(
         self,

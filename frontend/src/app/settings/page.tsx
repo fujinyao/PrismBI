@@ -2,7 +2,7 @@
 
 import { useState, useCallback, useEffect, useMemo } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { settingsApi, setRequestTimeout } from '@/lib/api'
+import { settingsApi } from '@/lib/api'
 import { Tabs } from '@/components/ui/Tabs'
 import { BrandingSettings } from '@/components/settings/BrandingSettings'
 import { ThemeSettings } from '@/components/settings/ThemeSettings'
@@ -100,7 +100,18 @@ export default function SettingsPage() {
   })
 
   const llmMutation = useMutation({
-    mutationFn: (data: { provider?: string; api_key?: string; model?: string; endpoint?: string; max_tokens?: number; temperature?: number; extra_params?: Record<string, unknown>; system_prompt?: string }) =>
+    mutationFn: (data: {
+      provider?: string
+      api_key?: string
+      model?: string
+      endpoint?: string
+      max_tokens?: number
+      temperature?: number
+      extra_params?: Record<string, unknown>
+      system_prompt?: string
+      probed_capabilities?: Record<string, unknown>
+      probe_session_id?: string
+    }) =>
       settingsApi.llm(data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['settings', 'private'] })
@@ -119,43 +130,11 @@ export default function SettingsPage() {
       timezone?: string
       date_format?: string
       session_timeout?: number
-      route_observability_window_minutes?: number
-      request_timeout_ms?: number
-      llm_read_timeout_s?: number
-      db_connect_timeout_s?: number
-      route_observability_persist_enabled?: boolean
-      route_observability_persist_interval_seconds?: number
-      route_observability_persist_event_delta?: number
-      model_ref_case_sensitive?: boolean
     }) =>
       settingsApi.general(data),
-    onSuccess: (_data, variables) => {
-      queryClient.setQueryData(['settings', 'private'], (old: any) => {
-        const currentSettings = old?.settings ?? old ?? {}
-        const mapped: Record<string, unknown> = {
-          ...variables,
-          request_timeout_ms: variables.request_timeout_ms,
-          timeout_request_ms: variables.request_timeout_ms,
-          llm_read_timeout_s: variables.llm_read_timeout_s,
-          timeout_llm_read_s: variables.llm_read_timeout_s,
-          db_connect_timeout_s: variables.db_connect_timeout_s,
-          timeout_db_connect_s: variables.db_connect_timeout_s,
-          router_route_observability_persist_enabled: variables.route_observability_persist_enabled,
-          router_route_observability_persist_interval_seconds: variables.route_observability_persist_interval_seconds,
-          router_route_observability_persist_event_delta: variables.route_observability_persist_event_delta,
-          router_model_ref_case_sensitive: variables.model_ref_case_sensitive,
-        }
-        if (typeof variables.route_observability_window_minutes === 'number') {
-          mapped.router_route_observability_window_seconds = Math.round(variables.route_observability_window_minutes * 60)
-        }
-        const nextSettings = { ...currentSettings, ...mapped }
-        return { ...(old ?? {}), settings: nextSettings, ...nextSettings }
-      })
+    onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['settings', 'private'] })
       queryClient.invalidateQueries({ queryKey: ['settings', 'audit-summary'] })
-      if (variables.request_timeout_ms) {
-        setRequestTimeout(variables.request_timeout_ms)
-      }
       toast(t('toast.generalSaved', 'General settings saved'), 'success')
     },
     onError: (err) =>
@@ -168,7 +147,7 @@ export default function SettingsPage() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['settings', 'private'] })
       queryClient.invalidateQueries({ queryKey: ['settings', 'audit-summary'] })
-      toast(t('toast.askSettingsSaved', '问答设置已保存'), 'success')
+      toast(t('toast.askSettingsSaved', '设置已保存'), 'success')
     },
     onError: (err) =>
       toast(err instanceof Error ? err.message : t('toast.askSettingsSaveFailed', '保存问答设置失败'), 'error'),
@@ -180,22 +159,12 @@ export default function SettingsPage() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['settings', 'private'] })
       queryClient.invalidateQueries({ queryKey: ['settings', 'audit-summary'] })
-      toast(t('toast.routerSettingsSaved', '路由设置已保存'), 'success')
     },
-    onError: (err) =>
-      toast(err instanceof Error ? err.message : t('toast.routerSettingsSaveFailed', '保存路由设置失败'), 'error'),
+    onError: (err) => {
+      console.warn('Router settings save failed (ask save may have succeeded):', err)
+    },
   })
 
-  const routerRuntimeReloadMutation = useMutation({
-    mutationFn: () => settingsApi.routerRuntimeReload(),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['settings', 'private'] })
-      queryClient.invalidateQueries({ queryKey: ['settings', 'audit-summary'] })
-      toast(t('toast.routerRuntimeReloaded', 'Router runtime reloaded'), 'success')
-    },
-    onError: (err) =>
-      toast(err instanceof Error ? err.message : t('toast.routerRuntimeReloadFailed', 'Failed to reload router runtime'), 'error'),
-  })
 
   const languageMutation = useMutation({
     mutationFn: async (lang: LocaleCode) => lang,
@@ -237,7 +206,7 @@ export default function SettingsPage() {
         return (
             <LLMSettings
               settings={settings}
-              onSave={(s) => llmMutation.mutate(s)}
+              onSave={(s) => llmMutation.mutateAsync(s)}
               saving={llmMutation.isPending}
               canSave={canUpdateSettings}
             />
@@ -266,8 +235,6 @@ export default function SettingsPage() {
             <GeneralSettings
               settings={settings}
               onSave={(s) => generalMutation.mutate(s)}
-              onRouterRuntimeReload={() => routerRuntimeReloadMutation.mutate()}
-              routerRuntimeReloading={routerRuntimeReloadMutation.isPending}
               saving={generalMutation.isPending}
               canSave={canUpdateSettings}
             />
@@ -285,7 +252,7 @@ export default function SettingsPage() {
       default:
         return <Skeleton className="h-40 w-full" />
     }
-  }, [activeTab, canReadSettings, isLoading, isError, settings, brandingMutation, themeMutation, llmMutation, generalMutation, askMutation, routerMutation, routerRuntimeReloadMutation, languageMutation, canUpdateSettings, locale, refetch, t, queryClient])
+  }, [activeTab, canReadSettings, isLoading, isError, settings, brandingMutation, themeMutation, llmMutation, generalMutation, askMutation, routerMutation, languageMutation, canUpdateSettings, locale, refetch, t, queryClient])
 
   return (
     <div className="min-h-full rounded-xl border border-gray-200 bg-white p-2 dark:border-gray-700 dark:bg-gray-900">

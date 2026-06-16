@@ -16,6 +16,7 @@ EstimateComplexityFn = Callable[[dict[str, Any], dict[str, Any]], int]
 StrictJsonCapabilityFn = Callable[[], dict[str, Any]]
 PromptProfileSelectionFn = Callable[..., Any]
 IsSqlRouteV2EnabledFn = Callable[[int | None], bool]
+ResolveModelTierFn = Callable[[], str | None]
 
 
 @dataclass(slots=True)
@@ -50,6 +51,7 @@ class GenerationPipeline:
         strict_json_capability: StrictJsonCapabilityFn,
         prompt_profile_selection: PromptProfileSelectionFn,
         is_sql_route_v2_enabled: IsSqlRouteV2EnabledFn,
+        resolve_model_tier: ResolveModelTierFn | None = None,
     ) -> None:
         self._normalize_question_analysis = normalize_question_analysis
         self._semantic_prompt = semantic_prompt
@@ -63,6 +65,7 @@ class GenerationPipeline:
         self._strict_json_capability = strict_json_capability
         self._prompt_profile_selection = prompt_profile_selection
         self._is_sql_route_v2_enabled = is_sql_route_v2_enabled
+        self._resolve_model_tier = resolve_model_tier
 
     @staticmethod
     def legacy_engine(analysis: dict[str, Any], has_knowledge: bool) -> str:
@@ -118,21 +121,37 @@ class GenerationPipeline:
     ) -> tuple[GenerationPreparation | None, dict[str, Any] | None]:
         normalized_analysis = self._normalize_question_analysis(analysis)
 
+        model_tier: str | None = None
+        if callable(self._resolve_model_tier):
+            try:
+                resolved_tier = self._resolve_model_tier()
+                if resolved_tier:
+                    model_tier = str(resolved_tier)
+            except Exception:
+                model_tier = None
+
         strict_json = self._strict_json_capability()
-        prompt_selection = self._prompt_profile_selection(
-            "sql_generation",
-            strict_json_mode=str(strict_json.get("mode") or "none"),
-        )
+        try:
+            prompt_selection = self._prompt_profile_selection(
+                "sql_generation",
+                strict_json_mode=str(strict_json.get("mode") or "none"),
+                model_tier=model_tier,
+            )
+        except TypeError:
+            prompt_selection = self._prompt_profile_selection(
+                "sql_generation",
+                strict_json_mode=str(strict_json.get("mode") or "none"),
+            )
         route_v2_enabled = self._is_sql_route_v2_enabled(project_id)
         shadow_mode = bool(router_config.get("sql_route_shadow_mode", False))
         use_profile = route_v2_enabled or shadow_mode
         response_format = (
-            getattr(prompt_selection, "response_format", None)
-            if use_profile and getattr(prompt_selection, "response_format", None)
+            prompt_selection.response_format
+            if use_profile and prompt_selection.response_format is not None
             else "json"
         )
         system_suffix = (
-            f"\n{getattr(prompt_selection, 'system_suffix', '')}"
+            f"\n<PROFILE>{getattr(prompt_selection, 'system_suffix', '')}</PROFILE>"
             if use_profile and getattr(prompt_selection, "system_suffix", "")
             else ""
         )

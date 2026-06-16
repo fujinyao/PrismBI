@@ -368,15 +368,18 @@ class TestSSETokenAuth:
 class TestAnalysisCache:
     def test_cache_key_format(self):
         from services.ask_service import _analysis_cache_key
+        import hashlib
         key = _analysis_cache_key("what is sales?", 5)
-        assert key == "5::what is sales?::"
+        question_hash = hashlib.sha256(b"what is sales?").hexdigest()[:32]
+        assert key == f"5::{question_hash}::"
 
     def test_cache_key_with_previous(self):
         from services.ask_service import _analysis_cache_key
         import hashlib, json
         key = _analysis_cache_key("compare A and B", 3, ["show sales"])
+        question_hash = hashlib.sha256(b"compare A and B").hexdigest()[:32]
         expected_hash = hashlib.sha256(json.dumps(["show sales"], sort_keys=True).encode()).hexdigest()[:16]
-        assert key == f"3::compare A and B::{expected_hash}"
+        assert key == f"3::{question_hash}::{expected_hash}"
 
     def test_cache_key_collision_resistant(self):
         from services.ask_service import _analysis_cache_key

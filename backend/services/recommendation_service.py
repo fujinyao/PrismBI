@@ -13,38 +13,25 @@ from services.ask_service import _language_name
 
 LOGGER = logging.getLogger(__name__)
 
-_RECOMMENDATION_LLM_PROMPT_EN = """You are a data analyst helping generate insightful questions about a dataset.
-Given the following data models and their columns, generate {max_questions} diverse, business-relevant questions in {language}.
-Each question should help a user discover meaningful insights from the data.
+_RECOMMENDATION_LLM_PROMPT = """You are a data analyst helping users discover insights from datasets.
+Based on the data model and its columns below, generate {max_questions} diverse, business-relevant questions in {language}.
 
-Return a JSON object with key "recommendations". The value must be an array of objects with keys: "question" (string), "category" (one of: trend, ranking, comparison, distribution, aggregation, anomaly, contribution, correlation, drilldown, relationship), "confidence" (0.0-1.0), and optional "model_names" (array of strings).
-Do not include any text outside the JSON object.
+Return a JSON object with key "recommendations" containing an array of objects. Each object must have:
+- "question": string, the question text
+- "category": one of trend, ranking, comparison, distribution, aggregation, anomaly, contribution, correlation, drilldown, relationship
+- "confidence": number between 0.0 and 1.0
+- "model_names": optional array of strings
+
+Output only JSON, no other text.
 
 Requirements:
-- Questions must use actual model and column names from the schema
-- Questions should vary in analytical depth (simple aggregation → deep insight)
-- Do NOT generate simple count questions like "How many X are there?"
-- Prefer insight-oriented questions: trends, anomalies, correlations, contributions
-- Ensure all questions are answerable with the given data models
+- Questions must use actual model and column names from the data model.
+- Vary analysis depth from simple summaries to deep insights.
+- Do not generate simple counting questions (e.g. "how many records").
+- Prioritize insight questions: trends, anomalies, correlations, contributions.
+- All generated questions must be answerable with the given data model.
 
-Models:
-{models_summary}"""
-
-_RECOMMENDATION_LLM_PROMPT_ZH = """你是一位数据分析师，正在帮助用户生成关于数据集的洞察性问题。
-根据以下数据模型及其列，用{language}生成{max_questions}个多样化的、具有业务价值的问题。
-每个问题都应帮助用户从数据中发现有意义的洞察。
-
-返回一个JSON对象，包含键"recommendations"。其值必须是数组，每个对象包含: "question" (字符串), "category" (取值: trend, ranking, comparison, distribution, aggregation, anomaly, contribution, correlation, drilldown, relationship), "confidence" (0.0-1.0), 可选"model_names" (字符串数组)。
-除JSON对象外不要输出任何文本。
-
-要求:
-- 问题必须使用数据模型中的实际模型名和列名
-- 问题应具有不同的分析深度（从简单汇总到深度洞察）
-- 不要生成简单的计数问题如"有多少X"
-- 优先考虑洞察类问题：趋势、异常、关联、贡献度
-- 确保所有问题都可以用给定的数据模型回答
-
-模型:
+Model:
 {models_summary}"""
 
 _VALID_RECOMMENDATION_CATEGORIES = {
@@ -1367,19 +1354,20 @@ def _repair_recommendation_items_with_llm(
     repair_messages = [
         {
             "role": "system",
-            "content": (
-                "You repair malformed recommendation payloads. "
-                "Return strict JSON only."
-            ),
+            "content": "You are responsible for fixing malformed recommendation data. Return strict JSON only.",
         },
         {
             "role": "user",
             "content": (
-                "Convert the following text into a valid JSON object with key \"recommendations\". "
-                "The value must be an array (max {max_questions} items) where each item has: "
-                "question (string), category (trend|ranking|comparison|distribution|aggregation|anomaly|contribution|correlation|drilldown|relationship), "
-                "confidence (0.0-1.0), optional model_names (string array). "
-                "If recovery is not possible, return {{\"recommendations\": []}}.\n\n"
+                "Convert the text below into a valid JSON object with key \"recommendations\" and an array value (max {max_questions} items).\n"
+                "Each item must contain:\n"
+                "- question (string)\n"
+                "- category (trend|ranking|comparison|distribution|aggregation|anomaly|contribution|correlation|drilldown|relationship)\n"
+                "- confidence (0.0-1.0)\n"
+                "- model_names (optional array of strings)\n"
+                "\n"
+                "If recovery is not possible, return {{\"recommendations\": []}}.\n"
+                "\n"
                 "Malformed text:\n{raw}"
             ).format(max_questions=max_questions, raw=str(raw_content or "")[:12000]),
         },
@@ -1405,12 +1393,12 @@ def generate_llm_recommendations(project_id: int, language: str = "en", max_ques
         return []
 
     lang_name = _language_name(language) or "English"
-    prompt_template = _RECOMMENDATION_LLM_PROMPT_ZH if language.strip().lower().replace("-", "_").startswith("zh") else _RECOMMENDATION_LLM_PROMPT_EN
+    prompt_template = _RECOMMENDATION_LLM_PROMPT
     prompt = prompt_template.format(max_questions=max_questions, language=lang_name, models_summary=models_summary)
 
     try:
         response = llm.chat([
-            {"role": "system", "content": "You are a helpful data analyst. Always respond with valid JSON only, no markdown."},
+            {"role": "system", "content": "You are a data analyst helping users discover insights from datasets. Return only valid JSON."},
             {"role": "user", "content": prompt},
         ], response_format="json")
         content = str(response.get("content", "") or "")

@@ -7,14 +7,17 @@ import { Button } from '@/components/ui/Button'
 import { useI18nStore } from '@/stores/i18nStore'
 import { useToast } from '@/components/ui/Toast'
 import { useQueryClient } from '@tanstack/react-query'
-import { settingsApi } from '@/lib/api'
+import { authApi, settingsApi } from '@/lib/api'
+import { createSSE, type SSEClient } from '@/lib/sse'
 
 interface LLMSettingsProps {
   settings: any
-  onSave: (s: any) => void
+  onSave: (s: any) => Promise<any> | void
   saving?: boolean
   canSave?: boolean
 }
+
+type ProbeRunStatus = 'idle' | 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
 
 const PROVIDER_LABELS: Record<string, string> = {
   openai: 'OpenAI',
@@ -118,6 +121,25 @@ const parseAdvancedBoolean = (value: unknown, fallback: boolean): boolean => {
   return fallback
 }
 
+const asRecord = (value: unknown): Record<string, unknown> | null => {
+  if (value && typeof value === 'object') return value as Record<string, unknown>
+  return null
+}
+
+const asProbeStatus = (value: unknown): ProbeRunStatus | null => {
+  if (
+    value === 'queued'
+    || value === 'running'
+    || value === 'completed'
+    || value === 'failed'
+    || value === 'cancelled'
+    || value === 'idle'
+  ) {
+    return value
+  }
+  return null
+}
+
 export function LLMSettings({ settings, onSave, saving, canSave = true }: LLMSettingsProps) {
   const t = useI18nStore((s) => s.t)
   const { toast } = useToast()
@@ -137,11 +159,24 @@ export function LLMSettings({ settings, onSave, saving, canSave = true }: LLMSet
   const [whitelistSaving, setWhitelistSaving] = useState(false)
   const [whitelistLoaded, setWhitelistLoaded] = useState(false)
   const modelRef = useRef(model)
+  const probeSseRef = useRef<SSEClient | null>(null)
   const [modelList, setModelList] = useState<string[]>([])
   const [modelListError, setModelListError] = useState<string | null>(null)
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<'success' | 'error' | null>(null)
   const [testErrorMsg, setTestErrorMsg] = useState<string | null>(null)
+  const [probeMode, setProbeMode] = useState<'fast' | 'full'>('fast')
+  const [probeSessionId, setProbeSessionId] = useState<string | null>(null)
+  const [probeStatus, setProbeStatus] = useState<ProbeRunStatus>('idle')
+  const [probeStep, setProbeStep] = useState<string | null>(null)
+  const [capabilitySaved, setCapabilitySaved] = useState(false)
+  const [testProbe, setTestProbe] = useState<{
+    tier?: string
+    modelKey?: string
+    probeLevel?: string
+    probedAt?: string
+    capabilities?: Record<string, unknown>
+  } | null>(null)
 
   const [llmMaxRetries, setLlmMaxRetries] = useState(ADVANCED_DEFAULTS.maxRetries)
   const [retryBaseDelaySeconds, setRetryBaseDelaySeconds] = useState(ADVANCED_DEFAULTS.retryBaseDelaySeconds)
@@ -160,6 +195,140 @@ export function LLMSettings({ settings, onSave, saving, canSave = true }: LLMSet
     modelRef.current = model
   }, [model])
 
+  const closeProbeStream = useCallback(() => {
+    if (probeSseRef.current) {
+      probeSseRef.current.close()
+      probeSseRef.current = null
+    }
+  }, [])
+
+  const applyProbeEvent = useCallback((raw: unknown) => {
+    const payload = asRecord(raw)
+    if (!payload) return
+
+    const payloadStatus = asProbeStatus(payload.status)
+    if (payloadStatus) {
+      setProbeStatus(payloadStatus)
+      if (payloadStatus === 'failed') {
+        setTestResult('error')
+      }
+      if (payloadStatus === 'cancelled') {
+        setTestResult('error')
+        setTestErrorMsg((prev) => prev || t('settings.llm.probeCancelled', 'Probe was cancelled'))
+      }
+      if (payloadStatus === 'completed' || payloadStatus === 'failed' || payloadStatus === 'cancelled') {
+        closeProbeStream()
+      }
+    }
+    if (typeof payload.error === 'string' && payload.error) {
+      setTestErrorMsg(payload.error)
+    }
+    if (typeof payload.capability_saved === 'boolean') {
+      setCapabilitySaved(payload.capability_saved)
+    }
+    if (typeof payload.session_id === 'string' && payload.session_id) {
+      setProbeSessionId(payload.session_id)
+    }
+
+    const probeName = typeof payload.probe === 'string' ? payload.probe : null
+    const stage = typeof payload.stage === 'number' ? payload.stage : null
+    const stageTotal = typeof payload.stage_total === 'number' ? payload.stage_total : null
+    if (probeName) {
+      if (stage !== null && stageTotal !== null) {
+        setProbeStep(`${probeName} (${stage}/${stageTotal})`)
+      } else {
+        setProbeStep(probeName)
+      }
+    }
+
+    const payloadTier = typeof payload.tier === 'string' ? payload.tier : undefined
+    const payloadProbeLevel = typeof payload.probe_level === 'string' ? payload.probe_level : undefined
+    const payloadProbedAt = typeof payload.probed_at === 'string' ? payload.probed_at : undefined
+    const payloadModelKey = typeof payload.model_key === 'string' ? payload.model_key : undefined
+
+    const caps = asRecord(payload.capabilities)
+    if (caps) {
+      const probeMeta = asRecord(caps.probe_meta)
+      const metaModelKey = probeMeta && typeof probeMeta.model_key === 'string' ? probeMeta.model_key : undefined
+      const metaProbeLevel = probeMeta && typeof probeMeta.probe_level === 'string' ? probeMeta.probe_level : undefined
+      const metaProbedAt = probeMeta && typeof probeMeta.probed_at === 'string' ? probeMeta.probed_at : undefined
+      setTestProbe((prev) => ({
+        tier: payloadTier ?? prev?.tier,
+        modelKey: payloadModelKey ?? metaModelKey ?? prev?.modelKey,
+        probeLevel: payloadProbeLevel ?? metaProbeLevel ?? prev?.probeLevel,
+        probedAt: payloadProbedAt ?? metaProbedAt ?? prev?.probedAt,
+        capabilities: caps,
+      }))
+      if (payloadStatus === 'completed') {
+        setTestResult('success')
+      }
+      return
+    }
+
+    if (payloadTier || payloadProbeLevel || payloadProbedAt || payloadModelKey) {
+      setTestProbe((prev) => {
+        if (!prev) return prev
+        return {
+          ...prev,
+          tier: payloadTier ?? prev.tier,
+          modelKey: payloadModelKey ?? prev.modelKey,
+          probeLevel: payloadProbeLevel ?? prev.probeLevel,
+          probedAt: payloadProbedAt ?? prev.probedAt,
+        }
+      })
+    }
+  }, [closeProbeStream, t])
+
+  const openProbeStream = useCallback(async (sessionId: string) => {
+    if (!sessionId) return
+    closeProbeStream()
+    try {
+      const ticketResp = await authApi.wsTicket()
+      const ticket = ticketResp?.ticket
+      if (!ticket) {
+        throw new Error('Missing stream ticket')
+      }
+      const streamUrl = `/api/settings/llm/test/stream?session_id=${encodeURIComponent(sessionId)}&ticket=${encodeURIComponent(ticket)}`
+      const stream = createSSE(streamUrl, () => null)
+      probeSseRef.current = stream
+      const eventNames = [
+        'session_state',
+        'probe_queued',
+        'probe_started',
+        'stage_started',
+        'stage_completed',
+        'probe_completed',
+        'probe_done',
+        'probe_failed',
+        'probe_cancelled',
+        'progress',
+        'message',
+      ]
+      eventNames.forEach((name) => {
+        stream.onEvent(name, applyProbeEvent)
+      })
+      stream.onMessage(applyProbeEvent)
+    } catch (err) {
+      setProbeStatus('failed')
+      setTestErrorMsg(err instanceof Error ? err.message : 'Failed to open probe stream')
+    }
+  }, [applyProbeEvent, closeProbeStream])
+
+  useEffect(() => () => {
+    closeProbeStream()
+  }, [closeProbeStream])
+
+  useEffect(() => {
+    closeProbeStream()
+    setTestResult(null)
+    setTestErrorMsg(null)
+    setTestProbe(null)
+    setProbeSessionId(null)
+    setProbeStatus('idle')
+    setProbeStep(null)
+    setCapabilitySaved(false)
+  }, [provider, model, baseUrl, apiKey, closeProbeStream])
+
   useEffect(() => {
     if (settingsLoaded || !settings) return
     setProvider(settings.llm_provider ?? settings.provider ?? 'openai')
@@ -173,15 +342,22 @@ export function LLMSettings({ settings, onSave, saving, canSave = true }: LLMSet
   }, [settings, settingsLoaded])
 
   useEffect(() => {
-    settingsApi.llmWhitelist().then((data) => {
-      setWhitelistEnabled(data.enabled)
-      setWhitelistPrefixes(data.prefixes)
-      setWhitelistDefaults(data.defaults)
-      setWhitelistLoaded(true)
-    }).catch(() => {
-      setWhitelistLoaded(true)
-    })
-  }, [])
+    queryClient
+      .fetchQuery({
+        queryKey: ['settings', 'llm-whitelist'],
+        queryFn: () => settingsApi.llmWhitelist(),
+        staleTime: 30_000,
+      })
+      .then((data) => {
+        setWhitelistEnabled(data.enabled)
+        setWhitelistPrefixes(data.prefixes)
+        setWhitelistDefaults(data.defaults)
+        setWhitelistLoaded(true)
+      })
+      .catch(() => {
+        setWhitelistLoaded(true)
+      })
+  }, [queryClient])
 
   useEffect(() => {
     if (advancedLoaded) return
@@ -213,7 +389,12 @@ export function LLMSettings({ settings, onSave, saving, canSave = true }: LLMSet
       general_chat_history_limit: settings.llm_general_chat_history_limit,
     }
 
-    settingsApi.llmAdvanced()
+    queryClient
+      .fetchQuery({
+        queryKey: ['settings', 'llm-advanced'],
+        queryFn: () => settingsApi.llmAdvanced(),
+        staleTime: 30_000,
+      })
       .then((data) => {
         if (!active) return
         applyAdvancedSettings(data as Record<string, unknown>)
@@ -230,7 +411,7 @@ export function LLMSettings({ settings, onSave, saving, canSave = true }: LLMSet
     return () => {
       active = false
     }
-  }, [advancedLoaded, settings])
+  }, [advancedLoaded, queryClient, settings])
 
   const fetchModels = useCallback(async () => {
     setModelListError(null)
@@ -253,6 +434,7 @@ export function LLMSettings({ settings, onSave, saving, canSave = true }: LLMSet
 
   const handleProviderChange = (nextProvider: string) => {
     const defaults = PROVIDER_DEFAULTS[nextProvider]
+    closeProbeStream()
     setProvider(nextProvider)
     setApiKey('')
     setModelList([])
@@ -264,29 +446,95 @@ export function LLMSettings({ settings, onSave, saving, canSave = true }: LLMSet
       setTemperature(defaults.temperature)
     }
     setTestResult(null)
+    setTestErrorMsg(null)
+    setTestProbe(null)
+    setProbeSessionId(null)
+    setProbeStatus('idle')
+    setProbeStep(null)
+    setCapabilitySaved(false)
   }
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     const payload: Record<string, unknown> = { provider, model, temperature, max_tokens: maxTokens, endpoint: baseUrl, system_prompt: systemPrompt }
     if (apiKey) payload.api_key = apiKey
-    onSave(payload)
+    if (probeSessionId) payload.probe_session_id = probeSessionId
+    if (testResult === 'success' && testProbe?.capabilities) {
+      payload.probed_capabilities = testProbe.capabilities
+    }
+    try {
+      const response = await onSave(payload)
+      const result = asRecord(response)
+      if (!result) return
+      if (typeof result.capability_saved === 'boolean') {
+        setCapabilitySaved(result.capability_saved)
+      }
+      if (typeof result.probe_session_id === 'string' && result.probe_session_id) {
+        setProbeSessionId(result.probe_session_id)
+      }
+      const caps = asRecord(result.capabilities)
+      if (caps) {
+        const probeMeta = asRecord(caps.probe_meta)
+        const metaModelKey = probeMeta && typeof probeMeta.model_key === 'string' ? probeMeta.model_key : undefined
+        const metaProbeLevel = probeMeta && typeof probeMeta.probe_level === 'string' ? probeMeta.probe_level : undefined
+        const metaProbedAt = probeMeta && typeof probeMeta.probed_at === 'string' ? probeMeta.probed_at : undefined
+        setTestProbe((prev) => ({
+          tier: typeof result.tier === 'string' ? result.tier : prev?.tier,
+          modelKey: metaModelKey ?? prev?.modelKey,
+          probeLevel: metaProbeLevel ?? prev?.probeLevel,
+          probedAt: metaProbedAt ?? prev?.probedAt,
+          capabilities: caps,
+        }))
+      }
+    } catch {
+      // mutation already handles user-facing error feedback
+    }
   }
 
   const handleTest = async () => {
+    closeProbeStream()
     setTesting(true)
     setTestResult(null)
     setTestErrorMsg(null)
+    setTestProbe(null)
+    setProbeSessionId(null)
+    setProbeStatus('idle')
+    setProbeStep(null)
+    setCapabilitySaved(false)
     try {
-      const result = await settingsApi.llmTest({ provider, api_key: apiKey, model, endpoint: baseUrl })
+      const result = await settingsApi.llmTest({
+        provider,
+        api_key: apiKey,
+        model,
+        endpoint: baseUrl,
+        probe_level: probeMode,
+      })
       if (result.success) {
         setTestResult('success')
+        const incomingStatus = asProbeStatus(result.probe_status)
+        setProbeStatus(incomingStatus ?? 'running')
+        setCapabilitySaved(Boolean(result.capability_saved))
+        const incomingSessionId = typeof result.probe_session_id === 'string' ? result.probe_session_id : null
+        setProbeSessionId(incomingSessionId)
+        setProbeStep(incomingStatus === 'completed' ? null : t('settings.llm.probeRunning', 'Probing...'))
+        setTestProbe({
+          tier: result.tier,
+          modelKey: result.model_key,
+          probeLevel: result.probe_level,
+          probedAt: result.probed_at,
+          capabilities: result.capabilities,
+        })
+        if (incomingSessionId) {
+          void openProbeStream(incomingSessionId)
+        }
       } else {
         setTestResult('error')
+        setProbeStatus('failed')
         setTestErrorMsg(result.error || 'Unknown error')
       }
     } catch (err) {
       setTestResult('error')
+      setProbeStatus('failed')
       setTestErrorMsg(err instanceof Error ? err.message : 'Request failed')
     } finally {
       setTesting(false)
@@ -298,6 +546,7 @@ export function LLMSettings({ settings, onSave, saving, canSave = true }: LLMSet
     try {
       await settingsApi.llmWhitelistUpdate({ enabled: whitelistEnabled, prefixes: whitelistPrefixes })
       queryClient.invalidateQueries({ queryKey: ['settings', 'private'] })
+      queryClient.invalidateQueries({ queryKey: ['settings', 'llm-whitelist'] })
       toast(t('toast.whitelistSaved', 'Whitelist settings saved'), 'success')
     } catch (err) {
       toast(err instanceof Error ? err.message : t('toast.whitelistSaveFailed', 'Failed to save whitelist'), 'error')
@@ -322,6 +571,7 @@ export function LLMSettings({ settings, onSave, saving, canSave = true }: LLMSet
       })
       queryClient.invalidateQueries({ queryKey: ['settings', 'private'] })
       queryClient.invalidateQueries({ queryKey: ['settings', 'audit-summary'] })
+      queryClient.invalidateQueries({ queryKey: ['settings', 'llm-advanced'] })
       toast(t('toast.llmAdvancedSaved', 'LLM advanced settings saved'), 'success')
     } catch (err) {
       toast(err instanceof Error ? err.message : t('toast.llmAdvancedSaveFailed', 'Failed to save LLM advanced settings'), 'error')
@@ -344,6 +594,30 @@ export function LLMSettings({ settings, onSave, saving, canSave = true }: LLMSet
 
   const handleResetWhitelist = () => {
     setWhitelistPrefixes([...whitelistDefaults])
+  }
+
+  const capabilityBool = (section: string, key: string): string | null => {
+    const caps = testProbe?.capabilities
+    if (!caps || typeof caps !== 'object') return null
+    const part = (caps as Record<string, unknown>)[section]
+    if (!part || typeof part !== 'object') return null
+    const raw = (part as Record<string, unknown>)[key]
+    if (typeof raw !== 'boolean') return null
+    return raw ? t('common.yes', 'Yes') : t('common.no', 'No')
+  }
+
+  const capabilityText = (section: string, key: string): string | null => {
+    const caps = testProbe?.capabilities
+    if (!caps || typeof caps !== 'object') return null
+    const part = (caps as Record<string, unknown>)[section]
+    if (!part || typeof part !== 'object') return null
+    const raw = (part as Record<string, unknown>)[key]
+    if (raw == null) return null
+    if (typeof raw === 'number') {
+      return Number.isFinite(raw) ? String(raw) : null
+    }
+    if (typeof raw === 'string') return raw
+    return null
   }
 
   return (
@@ -482,7 +756,31 @@ export function LLMSettings({ settings, onSave, saving, canSave = true }: LLMSet
           <Card>
             <CardContent className="space-y-3">
               <div className="flex flex-wrap items-center gap-3">
-                <Button type="button" variant="secondary" onClick={handleTest} loading={testing}>
+                <label className="text-xs font-medium text-gray-700 dark:text-gray-300">
+                  {t('settings.llm.probeMode', 'Probe Mode')}
+                </label>
+                <select
+                  value={probeMode}
+                  onChange={(e) => setProbeMode((e.target.value === 'full' ? 'full' : 'fast'))}
+                  className="rounded-md border border-gray-300 bg-white px-2 py-1 text-xs text-gray-900 focus:outline-none focus:ring-2 focus:ring-primary-300 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
+                >
+                  <option value="fast">{t('settings.llm.probeModeFast', 'Fast (recommended)')}</option>
+                  <option value="full">{t('settings.llm.probeModeFull', 'Full')}</option>
+                </select>
+                <span className="text-xs text-gray-500 dark:text-gray-400">
+                  {probeMode === 'fast'
+                    ? t('settings.llm.probeModeFastHint', 'Fast: metadata + JSON + single latency probe.')
+                    : t('settings.llm.probeModeFullHint', 'Full: includes system/SQL/repair checks + 3 latency probes.')}
+                </span>
+              </div>
+              <div className="flex flex-wrap items-center gap-3">
+                <Button
+                  type="button"
+                  variant="secondary"
+                  onClick={handleTest}
+                  loading={testing}
+                  disabled={testing || probeStatus === 'running' || probeStatus === 'queued'}
+                >
                   {t('settings.llm.testConnection', 'Test Connection')}
                 </Button>
                 <div className="ml-auto">
@@ -490,9 +788,71 @@ export function LLMSettings({ settings, onSave, saving, canSave = true }: LLMSet
                 </div>
               </div>
               {testResult === 'success' && (
-                <span className="text-sm font-medium text-success-600 dark:text-success-400">
-                  {t('settings.llm.connectionSuccess', 'Connection successful!')}
-                </span>
+                <div className="space-y-2 rounded-md border border-success-200 bg-success-50 p-3 dark:border-success-900/40 dark:bg-success-900/10">
+                  <span className="text-sm font-medium text-success-700 dark:text-success-300">
+                    {t('settings.llm.connectionSuccess', 'Connection successful!')}
+                  </span>
+                  {testProbe && (
+                    <div className="space-y-2 text-xs text-success-800 dark:text-success-200">
+                      <div className="grid gap-1 md:grid-cols-2">
+                        <div>
+                          <span className="font-medium">{t('settings.llm.probeTier', 'Tier')}:</span> {testProbe.tier || '-'}
+                        </div>
+                        <div>
+                          <span className="font-medium">{t('settings.llm.probeStatus', 'Probe Status')}:</span> {probeStatus}
+                        </div>
+                        <div>
+                          <span className="font-medium">{t('settings.llm.probeLevel', 'Probe Level')}:</span> {testProbe.probeLevel || '-'}
+                        </div>
+                        <div>
+                          <span className="font-medium">{t('settings.llm.capabilitySaved', 'Capabilities Saved')}:</span> {capabilitySaved ? t('common.yes', 'Yes') : t('common.no', 'No')}
+                        </div>
+                        <div className="md:col-span-2 break-all">
+                          <span className="font-medium">{t('settings.llm.modelKey', 'Model Key')}:</span> {testProbe.modelKey || '-'}
+                        </div>
+                        <div className="md:col-span-2 break-all">
+                          <span className="font-medium">{t('settings.llm.probeSession', 'Probe Session')}:</span> {probeSessionId || '-'}
+                        </div>
+                        <div className="md:col-span-2">
+                          <span className="font-medium">{t('settings.llm.probeStep', 'Current Step')}:</span> {probeStep || '-'}
+                        </div>
+                        <div className="md:col-span-2">
+                          <span className="font-medium">{t('settings.llm.probedAt', 'Probed At')}:</span> {testProbe.probedAt || '-'}
+                        </div>
+                      </div>
+
+                      <div className="grid gap-1 md:grid-cols-2">
+                        <div>
+                          <span className="font-medium">JSON Schema:</span> {capabilityBool('structured_output', 'supports_json_schema') ?? '-'}
+                        </div>
+                        <div>
+                          <span className="font-medium">JSON Object:</span> {capabilityBool('structured_output', 'supports_json_object') ?? '-'}
+                        </div>
+                        <div>
+                          <span className="font-medium">JSON Reliable:</span> {capabilityBool('structured_output', 'json_mode_reliable') ?? '-'}
+                        </div>
+                        <div>
+                          <span className="font-medium">SQL Tier:</span> {capabilityText('sql_quality', 'sql_accuracy_tier') ?? '-'}
+                        </div>
+                        <div>
+                          <span className="font-medium">Hallucination Risk:</span> {capabilityText('sql_quality', 'sql_hallucination_risk') ?? '-'}
+                        </div>
+                        <div>
+                          <span className="font-medium">Repair Capable:</span> {capabilityBool('repair', 'repair_capability') ?? '-'}
+                        </div>
+                        <div>
+                          <span className="font-medium">Streaming:</span> {capabilityBool('performance', 'supports_streaming') ?? '-'}
+                        </div>
+                        <div>
+                          <span className="font-medium">Vision:</span> {capabilityBool('performance', 'supports_vision') ?? '-'}
+                        </div>
+                        <div>
+                          <span className="font-medium">Tool Calling:</span> {capabilityBool('performance', 'supports_tool_calling') ?? '-'}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
               )}
               {testResult === 'error' && (
                 <div>

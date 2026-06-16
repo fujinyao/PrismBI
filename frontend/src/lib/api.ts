@@ -199,13 +199,20 @@ export interface QueryRouteDimensions {
   fallback_count_total: number
   fallback_count_avg: number
   fallback_count_max: number
+  generation_fallback_chain_step: Record<string, number>
+  generation_fallback_chain_pattern: Record<string, number>
   repair_used: number
   generation_retry_reason: Record<string, number>
   validation_issue_bucket: Record<string, number>
+  validation_issue_bucket_transition: Record<string, number>
   llm_empty_response_retry: number
   repair_guard_blocked: number
   repair_short_circuit: number
   repair_short_circuit_reason: Record<string, number>
+  repair_short_circuit_issue_bucket: Record<string, number>
+  repair_short_circuit_dominant_issue_bucket: Record<string, number>
+  repair_short_circuit_issue_bucket_streak_max: number
+  repair_short_circuit_circuitable_issue_bucket_streak_max: number
   schema_link_fallback_total: number
   schema_link_fallback_reason: Record<string, number>
   schema_link_fallback_rate: number
@@ -215,6 +222,33 @@ export interface QueryRouteDimensions {
   final_answer_fallback_total: number
   final_answer_fallback_reason: Record<string, number>
   final_answer_fallback_rate: number
+  decompose_stage_total: number
+  decompose_stage_status: Record<string, number>
+  decompose_stage_reason: Record<string, number>
+  decompose_stage_elapsed_ms_avg: number
+  decompose_stage_elapsed_ms_p50: number
+  decompose_stage_elapsed_ms_p95: number
+  decompose_stage_elapsed_ms_max: number
+  decompose_stage_budget_exceeded: number
+  duckdb_did_you_mean_fix_total: number
+  duckdb_did_you_mean_fix_status: Record<string, number>
+  duckdb_did_you_mean_fix_applied: number
+  route_alert_repair_timeout_short_circuit_warning_rate?: number
+  route_alert_repair_timeout_short_circuit_critical_rate?: number
+  route_alert_repair_timeout_short_circuit_min_warning_events?: number
+  route_alert_repair_timeout_short_circuit_min_critical_events?: number
+  route_alert_repair_budget_low_short_circuit_warning_rate?: number
+  route_alert_repair_budget_low_short_circuit_critical_rate?: number
+  route_alert_repair_budget_low_short_circuit_min_warning_events?: number
+  route_alert_repair_budget_low_short_circuit_min_critical_events?: number
+  route_alert_json_reask_warning_rate?: number
+  route_alert_json_reask_critical_rate?: number
+  route_alert_json_reask_min_warning_decisions?: number
+  route_alert_json_reask_min_critical_decisions?: number
+  route_alert_decompose_cancelled_warning_rate?: number
+  route_alert_decompose_cancelled_critical_rate?: number
+  route_alert_decompose_cancelled_min_warning_events?: number
+  route_alert_decompose_cancelled_min_critical_events?: number
   window_seconds: number
   last_updated: number
 }
@@ -260,6 +294,11 @@ export interface RouterRuntimeSnapshot {
   adaptive_strategy_consensus_risk_threshold?: number
   adaptive_strategy_decompose_risk_threshold?: number
   adaptive_strategy_min_subquestions_for_decompose?: number
+  decompose_merge_stage_budget_s?: number
+  sql_generation_total_budget_s?: number
+  duckdb_did_you_mean_fix_enabled?: boolean
+  duckdb_did_you_mean_allow_internal_tables?: boolean
+  duckdb_did_you_mean_max_retries?: number
   route_observability_window_seconds?: number
   route_observability_max_events_per_project?: number
   route_observability_persist_enabled?: boolean
@@ -268,6 +307,22 @@ export interface RouterRuntimeSnapshot {
   route_observability_strategy_trend_max_points?: number
   route_observability_strategy_trend_persist_interval_seconds?: number
   route_observability_strategy_trend_persist_decision_delta?: number
+  route_alert_repair_timeout_short_circuit_warning_rate?: number
+  route_alert_repair_timeout_short_circuit_critical_rate?: number
+  route_alert_repair_timeout_short_circuit_min_warning_events?: number
+  route_alert_repair_timeout_short_circuit_min_critical_events?: number
+  route_alert_repair_budget_low_short_circuit_warning_rate?: number
+  route_alert_repair_budget_low_short_circuit_critical_rate?: number
+  route_alert_repair_budget_low_short_circuit_min_warning_events?: number
+  route_alert_repair_budget_low_short_circuit_min_critical_events?: number
+  route_alert_json_reask_warning_rate?: number
+  route_alert_json_reask_critical_rate?: number
+  route_alert_json_reask_min_warning_decisions?: number
+  route_alert_json_reask_min_critical_decisions?: number
+  route_alert_decompose_cancelled_warning_rate?: number
+  route_alert_decompose_cancelled_critical_rate?: number
+  route_alert_decompose_cancelled_min_warning_events?: number
+  route_alert_decompose_cancelled_min_critical_events?: number
   sql_route_v2_enabled?: boolean
   sql_route_shadow_mode?: boolean
   sql_route_profile_id?: string
@@ -342,6 +397,10 @@ class HttpClient {
 
   constructor(baseUrl: string) {
     this.baseUrl = baseUrl
+  }
+
+  getBaseUrl(): string {
+    return this.baseUrl
   }
 
   private getToken(): string | null {
@@ -671,7 +730,7 @@ export const adminBackupApi = {
   list: () => api.get<BackupEntry[]>('/admin/backups'),
   create: () => api.post<BackupEntry>('/admin/backups'),
   get: (name: string) => api.get<BackupEntry>(`/admin/backups/${name}`),
-  downloadUrl: (name: string) => `/api/admin/backups/${name}/download`,
+  downloadUrl: (name: string) => `${api.getBaseUrl()}/admin/backups/${name}/download`,
   restore: (name: string) => api.post<{ success: boolean; error?: string }>('/admin/backups/restore', { name }),
   delete: (name: string) => api.delete<{ success: boolean }>(`/admin/backups/${name}`),
 }
@@ -742,7 +801,7 @@ export const projectsApi = {
       api.post<{ tables_discovered: number; tables_removed: number }>(`/projects/${projectId}/datasources/${bindingId}/sync`),
   },
   exportProject: (projectId: number, format: 'yaml' | 'json' = 'yaml') => {
-    const url = `/api/projects/${projectId}/export?format=${format}`
+    const url = `${api.getBaseUrl()}/projects/${projectId}/export?format=${format}`
     const controller = typeof AbortController !== 'undefined' ? new AbortController() : null
     const timeoutMs = getRequestTimeout() * 3 || 120000
     const timeoutToken = '__PRISMBI_EXPORT_TIMEOUT__'
@@ -1189,10 +1248,40 @@ export const settingsApi = {
     api.put<{ success: boolean }>('/settings/branding', data),
   theme: (data: { mode?: 'light' | 'dark' | 'system'; primary_color?: string; border_radius?: string; font?: string }) =>
     api.put<{ success: boolean }>('/settings/theme', data),
-  llm: (data: { provider?: string; api_key?: string; model?: string; endpoint?: string; max_tokens?: number; temperature?: number; extra_params?: Record<string, unknown>; system_prompt?: string }) =>
-    api.put<{ success: boolean }>('/settings/llm', data),
-  llmTest: (data: { provider: string; api_key?: string; model: string; endpoint?: string }) =>
-    api.post<{ success: boolean; latency_ms?: number; error?: string }>('/settings/llm/test', data),
+  llm: (data: {
+    provider?: string
+    api_key?: string
+    model?: string
+    endpoint?: string
+    max_tokens?: number
+    temperature?: number
+    extra_params?: Record<string, unknown>
+    system_prompt?: string
+    probed_capabilities?: Record<string, unknown>
+    probe_session_id?: string
+  }) =>
+    api.put<{
+      success: boolean
+      capabilities?: Record<string, unknown>
+      tier?: string
+      capability_saved?: boolean
+      probe_session_id?: string
+    }>('/settings/llm', data),
+  llmTest: (data: { provider: string; api_key?: string; model: string; endpoint?: string; probe_level?: 'fast' | 'full' }) =>
+    api.post<{
+      success: boolean
+      latency_ms?: number
+      error?: string
+      capabilities?: Record<string, unknown>
+      tier?: string
+      model_key?: string
+      probe_level?: string
+      probed_at?: string
+      probe_status?: string
+      probe_session_id?: string
+      capability_saved?: boolean
+      async?: boolean
+    }>('/settings/llm/test', data),
   llmModels: (data: { provider: string; api_key?: string; endpoint?: string }) =>
     api.post<{ models: string[]; error?: string }>('/settings/llm/models', data),
   llmWhitelist: () =>
@@ -1242,18 +1331,6 @@ export const settingsApi = {
     timezone?: string
     date_format?: string
     session_timeout?: number
-    route_observability_window_minutes?: number
-    request_timeout_ms?: number
-    llm_connect_timeout_s?: number
-    llm_read_timeout_s?: number
-    llm_write_timeout_s?: number
-    llm_pool_timeout_s?: number
-    db_connect_timeout_s?: number
-    model_list_timeout_s?: number
-    route_observability_persist_enabled?: boolean
-    route_observability_persist_interval_seconds?: number
-    route_observability_persist_event_delta?: number
-    model_ref_case_sensitive?: boolean
   }) =>
     api.put<{ success: boolean }>('/settings/general', data),
   auditSummary: (params?: {
@@ -1265,9 +1342,6 @@ export const settingsApi = {
     latest_offset?: number
   }) =>
     api.get<SettingsAuditSummary>('/settings/audit-summary', params as Record<string, string | number | boolean | undefined>),
-  getTimeouts: () => api.get<Record<string, number | null>>('/settings/timeouts'),
-  setTimeouts: (data: Record<string, number>) =>
-    api.put<{ success: boolean }>('/settings/timeouts', data),
   appInfo: () => api.get<{ version: string; platforms: string[] }>('/settings/app-info'),
   getRecommendations: () => api.get<Record<string, unknown>>('/settings/recommendations'),
   recommendations: (data: Record<string, unknown>) =>

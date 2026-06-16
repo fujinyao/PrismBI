@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from db import connection_lock, get_connection
 from models.schemas import (
@@ -20,9 +28,15 @@ from models.schemas import (
     RouterSettingsUpdate,
     SecuritySettingsUpdate,
     ThemeUpdate,
-    TimeoutUpdate,
 )
-from routers.auth import get_current_user, log_audit, payload_has_permission, require_permission
+from routers.auth import (
+    consume_ws_ticket,
+    get_current_user,
+    get_payload_from_token,
+    log_audit,
+    payload_has_permission,
+    require_permission,
+)
 from services.crypto_service import decrypt_json, encrypt_json, is_encrypted_value
 from services.llm_service import (
     DEFAULT_ENDPOINTS,
@@ -66,12 +80,401 @@ def _refresh_runtime_router_settings() -> None:
         LOGGER.warning("Failed to refresh ask/router runtime settings", exc_info=True)
 
 
+def _capabilities_to_tier(capabilities: dict) -> str:
+    try:
+        from services.sql_routing.llm_capability import _capabilities_to_tier as _tier
+        return _tier(capabilities)
+    except Exception:
+        return "weak"
+
+
+_SETTINGS_SSE_BEARER = HTTPBearer(auto_error=False)
+_LLM_PROBE_SESSION_TTL_SECONDS = 3600.0
+_LLM_PROBE_SESSION_STREAM_POLL_SECONDS = 0.35
+_LLM_PROBE_SESSION_STREAM_HEARTBEAT_SECONDS = 10.0
+_LLM_PROBE_SESSION_MAX = 256
+
+
+@dataclass
+class _LLMProbeSession:
+    session_id: str
+    user_id: int
+    provider: str
+    endpoint: str
+    model: str
+    probe_level: str
+    status: str = "queued"
+    tier: str = "weak"
+    capabilities: dict[str, Any] = field(default_factory=dict)
+    capability_saved: bool = False
+    error: str = ""
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    events: list[dict[str, Any]] = field(default_factory=list)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+
+
+_llm_probe_sessions_lock = threading.Lock()
+_llm_probe_sessions: dict[str, _LLMProbeSession] = {}
+_llm_probe_active_by_target: dict[str, str] = {}
+
+
+def _now_iso_utc() -> str:
+    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
+
+
+def _probe_sse_frame(event: str, payload: dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _llm_probe_target_key(*, user_id: int, provider: str, endpoint: str, model: str) -> str:
+    return f"{int(user_id)}:{str(provider or '').strip()}:{str(endpoint or '').strip()}:{str(model or '').strip()}"
+
+
+def _cleanup_llm_probe_sessions() -> None:
+    now_ts = time.time()
+    with _llm_probe_sessions_lock:
+        stale_session_ids = [
+            session_id
+            for session_id, session in _llm_probe_sessions.items()
+            if (now_ts - float(session.updated_at or session.created_at)) > _LLM_PROBE_SESSION_TTL_SECONDS
+        ]
+        for session_id in stale_session_ids:
+            _llm_probe_sessions.pop(session_id, None)
+        if stale_session_ids:
+            stale_set = set(stale_session_ids)
+            stale_active_keys = [
+                target_key
+                for target_key, active_session_id in _llm_probe_active_by_target.items()
+                if active_session_id in stale_set
+            ]
+            for target_key in stale_active_keys:
+                _llm_probe_active_by_target.pop(target_key, None)
+        if len(_llm_probe_sessions) > _LLM_PROBE_SESSION_MAX:
+            ordered = sorted(_llm_probe_sessions.values(), key=lambda item: float(item.updated_at or item.created_at))
+            drop_count = len(_llm_probe_sessions) - _LLM_PROBE_SESSION_MAX
+            for stale in ordered[:drop_count]:
+                _llm_probe_sessions.pop(stale.session_id, None)
+                stale_target_key = _llm_probe_target_key(
+                    user_id=stale.user_id,
+                    provider=stale.provider,
+                    endpoint=stale.endpoint,
+                    model=stale.model,
+                )
+                if _llm_probe_active_by_target.get(stale_target_key) == stale.session_id:
+                    _llm_probe_active_by_target.pop(stale_target_key, None)
+
+
+def _append_llm_probe_event(session: _LLMProbeSession, event: str, payload: Optional[dict[str, Any]] = None) -> None:
+    details = dict(payload or {})
+    details.setdefault("event", event)
+    details.setdefault("session_id", session.session_id)
+    details.setdefault("provider", session.provider)
+    details.setdefault("endpoint", session.endpoint)
+    details.setdefault("model", session.model)
+    details.setdefault("probe_level", session.probe_level)
+    details.setdefault("timestamp", _now_iso_utc())
+    with session.lock:
+        details.setdefault("status", session.status)
+        details.setdefault("tier", session.tier)
+        details.setdefault("capability_saved", session.capability_saved)
+        session.events.append(details)
+        session.updated_at = time.time()
+
+
+def _llm_probe_session_snapshot(session: _LLMProbeSession) -> dict[str, Any]:
+    with session.lock:
+        return {
+            "session_id": session.session_id,
+            "provider": session.provider,
+            "endpoint": session.endpoint,
+            "model": session.model,
+            "probe_level": session.probe_level,
+            "status": session.status,
+            "tier": session.tier,
+            "capability_saved": session.capability_saved,
+            "error": session.error,
+            "capabilities": dict(session.capabilities) if isinstance(session.capabilities, dict) else {},
+            "created_at": datetime.fromtimestamp(session.created_at, timezone.utc).isoformat(),
+            "updated_at": datetime.fromtimestamp(session.updated_at, timezone.utc).isoformat(),
+            "event_count": len(session.events),
+        }
+
+
+def _cancel_llm_probe_session(session: _LLMProbeSession, reason: str = "cancelled_by_new_request") -> None:
+    with session.lock:
+        already_terminal = session.status in {"completed", "failed", "cancelled"}
+        if already_terminal:
+            return
+        session.status = "cancelled"
+        session.error = reason
+        session.updated_at = time.time()
+        session.cancel_event.set()
+    _append_llm_probe_event(
+        session,
+        "probe_cancelled",
+        {
+            "status": "cancelled",
+            "reason": reason,
+            "capabilities": dict(session.capabilities) if isinstance(session.capabilities, dict) else {},
+            "capability_saved": session.capability_saved,
+            "tier": session.tier,
+        },
+    )
+
+
+def _create_llm_probe_session(
+    *,
+    user_id: int,
+    provider: str,
+    endpoint: str,
+    model: str,
+    probe_level: str,
+    initial_capabilities: Optional[dict[str, Any]] = None,
+) -> _LLMProbeSession:
+    _cleanup_llm_probe_sessions()
+    target_key = _llm_probe_target_key(
+        user_id=int(user_id),
+        provider=provider,
+        endpoint=endpoint,
+        model=model,
+    )
+    previous_active: Optional[_LLMProbeSession] = None
+    with _llm_probe_sessions_lock:
+        previous_id = _llm_probe_active_by_target.get(target_key)
+        if previous_id:
+            previous_active = _llm_probe_sessions.get(previous_id)
+
+    if previous_active is not None:
+        _cancel_llm_probe_session(previous_active, reason="replaced_by_new_probe")
+
+    session = _LLMProbeSession(
+        session_id=uuid.uuid4().hex,
+        user_id=int(user_id),
+        provider=str(provider or ""),
+        endpoint=str(endpoint or ""),
+        model=str(model or ""),
+        probe_level=str(probe_level or "fast"),
+    )
+    if isinstance(initial_capabilities, dict):
+        session.capabilities = dict(initial_capabilities)
+        session.tier = _capabilities_to_tier(session.capabilities)
+    session.capability_saved = False
+    with _llm_probe_sessions_lock:
+        _llm_probe_sessions[session.session_id] = session
+        _llm_probe_active_by_target[target_key] = session.session_id
+    _append_llm_probe_event(
+        session,
+        "probe_queued",
+        {
+            "status": "queued",
+            "capabilities": session.capabilities,
+            "tier": session.tier,
+            "capability_saved": False,
+        },
+    )
+    return session
+
+
+def _get_llm_probe_session_for_user(session_id: str, user_id: int) -> _LLMProbeSession:
+    _cleanup_llm_probe_sessions()
+    with _llm_probe_sessions_lock:
+        session = _llm_probe_sessions.get(str(session_id or "").strip())
+    if session is None:
+        raise HTTPException(status_code=404, detail="Probe session not found")
+    if int(session.user_id) != int(user_id):
+        raise HTTPException(status_code=404, detail="Probe session not found")
+    return session
+
+
+def _persist_llm_probe_capabilities(session: _LLMProbeSession, capabilities: dict[str, Any]) -> bool:
+    caps_to_save = dict(capabilities) if isinstance(capabilities, dict) else {}
+    if not caps_to_save:
+        return False
+    try:
+        from services.sql_routing.llm_capability import (
+            _memory_cache_key,
+            _memory_cache_set,
+            _save_capability_to_db,
+        )
+
+        _save_capability_to_db(session.provider, session.endpoint, session.model, caps_to_save)
+        _memory_cache_set(_memory_cache_key(session.provider, session.endpoint, session.model), caps_to_save)
+    except Exception as exc:
+        LOGGER.warning("Failed to persist async LLM probe capabilities: %s", exc)
+        return False
+
+    with session.lock:
+        session.capabilities = caps_to_save
+        session.tier = _capabilities_to_tier(caps_to_save)
+        session.capability_saved = True
+        session.updated_at = time.time()
+    return True
+
+
+def _normalize_capabilities_payload(
+    capabilities: dict[str, Any],
+    *,
+    provider: str,
+    endpoint: str,
+    model: str,
+    default_probe_level: str = "full",
+) -> dict[str, Any]:
+    normalized = dict(capabilities or {})
+    for section in ("structured_output", "sql_quality", "instruction", "repair", "performance"):
+        if not isinstance(normalized.get(section), dict):
+            normalized[section] = {}
+    probe_meta = normalized.get("probe_meta")
+    if not isinstance(probe_meta, dict):
+        probe_meta = {}
+    probe_meta["model_key"] = f"{provider}:{endpoint}:{model}"
+    probe_meta.setdefault("probe_level", default_probe_level or "full")
+    probe_meta.setdefault("probe_count", 1)
+    probe_meta.setdefault("probe_version", 2)
+    probe_meta.setdefault("last_error", "")
+    probe_meta.setdefault("probe_duration_ms", 0.0)
+    probe_meta.setdefault(
+        "probed_at",
+        datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+    )
+    normalized["probe_meta"] = probe_meta
+    return normalized
+
+
+def _start_llm_probe_async(session: _LLMProbeSession, *, api_key: str, schema_hint: str = "") -> None:
+    target_key = _llm_probe_target_key(
+        user_id=session.user_id,
+        provider=session.provider,
+        endpoint=session.endpoint,
+        model=session.model,
+    )
+
+    def _worker() -> None:
+        from services.sql_routing.llm_probe_suite import probe_sync
+
+        with session.lock:
+            session.status = "running"
+            session.error = ""
+            session.capability_saved = False
+            session.cancel_event.clear()
+            session.updated_at = time.time()
+        _append_llm_probe_event(session, "probe_started", {"status": "running", "capability_saved": False})
+
+        def _progress_callback(event: dict[str, Any]) -> None:
+            if session.cancel_event.is_set():
+                return
+            event_name = str(event.get("event") or "progress").strip() or "progress"
+            event_payload = dict(event)
+            incoming_caps = event_payload.get("capabilities") if isinstance(event_payload.get("capabilities"), dict) else None
+            if incoming_caps is not None:
+                _persist_llm_probe_capabilities(session, incoming_caps)
+
+            with session.lock:
+                if event_name == "probe_completed":
+                    session.status = "completed"
+                    session.error = ""
+                elif event_name == "probe_failed":
+                    session.status = "failed"
+                    session.error = str(event_payload.get("error") or "Probe failed")
+                else:
+                    session.status = "running"
+                session.updated_at = time.time()
+                event_payload["status"] = session.status
+                event_payload["capability_saved"] = session.capability_saved
+                event_payload["tier"] = session.tier
+
+            _append_llm_probe_event(session, event_name, event_payload)
+
+        try:
+            final_caps = probe_sync(
+                session.provider,
+                session.endpoint,
+                session.model,
+                schema_hint=schema_hint,
+                api_key=api_key,
+                probe_level=session.probe_level,
+                progress_cb=_progress_callback,
+                cancel_event=session.cancel_event,
+            )
+            if session.cancel_event.is_set():
+                _cancel_llm_probe_session(session, reason="cancelled")
+                return
+            if isinstance(final_caps, dict):
+                _persist_llm_probe_capabilities(session, final_caps)
+            with session.lock:
+                session.status = "completed"
+                session.error = ""
+                session.updated_at = time.time()
+                done_payload = {
+                    "status": session.status,
+                    "capability_saved": session.capability_saved,
+                    "tier": session.tier,
+                    "capabilities": dict(session.capabilities) if isinstance(session.capabilities, dict) else {},
+                }
+            _append_llm_probe_event(session, "probe_done", done_payload)
+        except Exception as exc:
+            error_text = f"{type(exc).__name__}: {str(exc)[:300]}"
+            with session.lock:
+                session.status = "failed"
+                session.error = error_text
+                session.updated_at = time.time()
+            _append_llm_probe_event(
+                session,
+                "probe_failed",
+                {
+                    "status": "failed",
+                    "error": error_text,
+                    "capability_saved": session.capability_saved,
+                    "capabilities": dict(session.capabilities) if isinstance(session.capabilities, dict) else {},
+                    "tier": session.tier,
+                },
+            )
+        finally:
+            with _llm_probe_sessions_lock:
+                if _llm_probe_active_by_target.get(target_key) == session.session_id:
+                    _llm_probe_active_by_target.pop(target_key, None)
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+
+
+async def _get_settings_sse_payload(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_SETTINGS_SSE_BEARER),
+    ticket: Optional[str] = Query(None),
+    token: Optional[str] = Query(None),
+) -> dict[str, Any]:
+    if ticket:
+        payload = consume_ws_ticket(str(ticket).strip())
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=401, detail="Invalid or expired ticket")
+        if not payload_has_permission(payload, "settings", "update"):
+            raise HTTPException(status_code=403, detail="Permission denied")
+        return payload
+
+    if credentials:
+        try:
+            payload = get_payload_from_token(credentials.credentials)
+            if not payload_has_permission(payload, "settings", "update"):
+                raise HTTPException(status_code=403, detail="Permission denied")
+            return payload
+        except HTTPException as exc:
+            if exc.status_code == 403:
+                raise
+    if token:
+        payload = get_payload_from_token(token)
+        if not payload_has_permission(payload, "settings", "update"):
+            raise HTTPException(status_code=403, detail="Permission denied")
+        return payload
+    raise HTTPException(status_code=401, detail="Authentication required")
+
+
 def _force_refresh_runtime_router_settings() -> dict[str, object]:
     from services.ask_service import refresh_runtime_router_settings
 
     snapshot = refresh_runtime_router_settings(force=True)
     router_config = snapshot.get("router_config") if isinstance(snapshot.get("router_config"), dict) else {}
-    return {
+    result: dict[str, object] = {
         "max_sql_rows": snapshot.get("MAX_SQL_ROWS"),
         "default_preview_row_limit": snapshot.get("DEFAULT_PREVIEW_ROW_LIMIT"),
         "min_preview_row_limit": snapshot.get("MIN_PREVIEW_ROW_LIMIT"),
@@ -79,24 +482,9 @@ def _force_refresh_runtime_router_settings() -> dict[str, object]:
         "max_source_materialization_rows": snapshot.get("MAX_SOURCE_MATERIALIZATION_ROWS"),
         "analysis_cache_max": snapshot.get("analysis_cache_max"),
         "analysis_cache_ttl_s": snapshot.get("analysis_cache_ttl_s"),
-        "adaptive_strategy_enabled": router_config.get("adaptive_strategy_enabled"),
-        "adaptive_strategy_consensus_risk_threshold": router_config.get("adaptive_strategy_consensus_risk_threshold"),
-        "adaptive_strategy_decompose_risk_threshold": router_config.get("adaptive_strategy_decompose_risk_threshold"),
-        "adaptive_strategy_min_subquestions_for_decompose": router_config.get("adaptive_strategy_min_subquestions_for_decompose"),
-        "route_observability_window_seconds": router_config.get("route_observability_window_seconds"),
-        "route_observability_max_events_per_project": router_config.get("route_observability_max_events_per_project"),
-        "route_observability_persist_enabled": router_config.get("route_observability_persist_enabled"),
-        "route_observability_persist_interval_seconds": router_config.get("route_observability_persist_interval_seconds"),
-        "route_observability_persist_event_delta": router_config.get("route_observability_persist_event_delta"),
-        "route_observability_strategy_trend_max_points": router_config.get("route_observability_strategy_trend_max_points"),
-        "route_observability_strategy_trend_persist_interval_seconds": router_config.get("route_observability_strategy_trend_persist_interval_seconds"),
-        "route_observability_strategy_trend_persist_decision_delta": router_config.get("route_observability_strategy_trend_persist_decision_delta"),
-        "sql_route_v2_enabled": router_config.get("sql_route_v2_enabled"),
-        "sql_route_shadow_mode": router_config.get("sql_route_shadow_mode"),
-        "model_ref_case_sensitive": router_config.get("model_ref_case_sensitive"),
-        "sql_route_profile_id": router_config.get("sql_route_profile_id"),
-        "sql_route_profile_version": router_config.get("sql_route_profile_version"),
     }
+    result.update(router_config)
+    return result
 
 
 def _payload_user_id(payload: dict | None) -> int | None:
@@ -444,18 +832,17 @@ def update_llm(
     payload: dict = Depends(require_permission("settings", "update")),
 ):
     updated_fields: list[str] = []
-    for field_name in (
-        "provider",
-        "api_key",
-        "model",
-        "endpoint",
-        "max_tokens",
-        "temperature",
-        "extra_params",
-        "system_prompt",
-    ):
+    standard_fields = (
+        "provider", "api_key", "model", "endpoint",
+        "max_tokens", "temperature", "extra_params", "system_prompt",
+    )
+    has_standard_update = False
+    for field_name in standard_fields:
         if getattr(body, field_name, None) is not None:
             updated_fields.append(field_name)
+            has_standard_update = True
+    if getattr(body, "probed_capabilities", None) is not None or getattr(body, "probe_session_id", None) is not None:
+        updated_fields.append("probe")
     if body.endpoint:
         try:
             from services.llm_service import _validate_llm_endpoint
@@ -478,7 +865,91 @@ def update_llm(
             "llm_system_prompt": body.system_prompt,
         })
     _audit_settings_update(payload, "llm", updated_fields)
-    return {"data": {"success": True}}
+    from services.llm_service import get_llm_config
+
+    cfg = get_llm_config()
+    llm_model = str(cfg.get("model") or "")
+    llm_endpoint = str(cfg.get("endpoint") or "")
+    llm_provider = str(cfg.get("provider") or "")
+    request_probe_session_id = str(body.probe_session_id or "").strip()
+    user_id = _payload_user_id(payload)
+
+    probe_session: Optional[_LLMProbeSession] = None
+    if request_probe_session_id and user_id is not None:
+        try:
+            probe_session = _get_llm_probe_session_for_user(request_probe_session_id, int(user_id))
+        except HTTPException:
+            probe_session = None
+
+    result_caps: dict = {}
+    capability_saved = False
+
+    if llm_model and llm_endpoint:
+        session_matches_model = (
+            probe_session is not None
+            and probe_session.provider == llm_provider
+            and probe_session.endpoint == llm_endpoint
+            and probe_session.model == llm_model
+        )
+
+        if session_matches_model and probe_session is not None:
+            with probe_session.lock:
+                session_saved = bool(probe_session.capability_saved)
+                session_caps = dict(probe_session.capabilities) if isinstance(probe_session.capabilities, dict) else {}
+
+            if session_saved and session_caps:
+                result_caps = session_caps
+                capability_saved = True
+            else:
+                source_caps: dict[str, Any] = {}
+                if isinstance(body.probed_capabilities, dict):
+                    source_caps = dict(body.probed_capabilities)
+                elif session_caps:
+                    source_caps = session_caps
+                if source_caps:
+                    normalized = _normalize_capabilities_payload(
+                        source_caps,
+                        provider=llm_provider,
+                        endpoint=llm_endpoint,
+                        model=llm_model,
+                        default_probe_level=probe_session.probe_level,
+                    )
+                    capability_saved = _persist_llm_probe_capabilities(probe_session, normalized)
+                    result_caps = normalized if capability_saved else source_caps
+        elif isinstance(body.probed_capabilities, dict):
+            try:
+                from services.sql_routing.llm_capability import (
+                    _memory_cache_key,
+                    _memory_cache_set,
+                    _save_capability_to_db,
+                )
+
+                normalized = _normalize_capabilities_payload(
+                    dict(body.probed_capabilities),
+                    provider=llm_provider,
+                    endpoint=llm_endpoint,
+                    model=llm_model,
+                    default_probe_level="full",
+                )
+                _save_capability_to_db(llm_provider, llm_endpoint, llm_model, normalized)
+                _memory_cache_set(_memory_cache_key(llm_provider, llm_endpoint, llm_model), normalized)
+                result_caps = normalized
+                capability_saved = True
+            except Exception as exc:
+                LOGGER.warning("Failed to persist provided LLM capabilities on save: %s", exc)
+                result_caps = {}
+                capability_saved = False
+
+    tier = _capabilities_to_tier(result_caps) if result_caps else "weak"
+    return {
+        "data": {
+            "success": True,
+            "capabilities": result_caps or {},
+            "tier": tier,
+            "capability_saved": capability_saved,
+            "probe_session_id": request_probe_session_id or None,
+        }
+    }
 
 
 @router.post("/llm/test", response_model=dict)
@@ -487,10 +958,14 @@ def test_llm(
     payload: dict = Depends(require_permission("settings", "update")),
 ):
     try:
+        requested_probe_level = str(body.probe_level or "fast").strip().lower()
+        if requested_probe_level not in {"fast", "full"}:
+            requested_probe_level = "fast"
         with connection_lock():
             con = get_connection()
             api_key = _resolve_llm_api_key(con, body.api_key)
         endpoint = body.endpoint or DEFAULT_ENDPOINTS.get(body.provider, "")
+        model_name = body.model or DEFAULT_MODELS.get(body.provider, "")
         if endpoint:
             try:
                 from services.llm_service import _validate_llm_endpoint
@@ -500,7 +975,7 @@ def test_llm(
         config = {
             "provider": body.provider,
             "api_key": api_key,
-            "model": body.model or DEFAULT_MODELS.get(body.provider, ""),
+            "model": model_name,
             "endpoint": endpoint,
             "max_tokens": 128,
             "temperature": 0,
@@ -510,10 +985,163 @@ def test_llm(
             {"role": "system", "content": "Reply with pong."},
             {"role": "user", "content": "ping"},
         ])
-        return {"data": {"success": bool(result.get("configured")), "latency_ms": result.get("latency_ms"), "error": None if result.get("configured") else result.get("content")}}
+        if not bool(result.get("configured")):
+            return {
+                "data": {
+                    "success": False,
+                    "latency_ms": result.get("latency_ms"),
+                    "error": result.get("content"),
+                }
+            }
+
+        from services.sql_routing.llm_capability import _keyword_fallback
+
+        initial_caps = _keyword_fallback(body.provider, endpoint, model_name)
+        user_id = _payload_user_id(payload)
+        if user_id is None:
+            return {
+                "data": {
+                    "success": False,
+                    "latency_ms": result.get("latency_ms"),
+                    "error": "Authentication required",
+                }
+            }
+        session = _create_llm_probe_session(
+            user_id=int(user_id),
+            provider=body.provider,
+            endpoint=endpoint,
+            model=model_name,
+            probe_level=requested_probe_level,
+            initial_capabilities=initial_caps,
+        )
+        _start_llm_probe_async(session, api_key=api_key)
+        session_state = _llm_probe_session_snapshot(session)
+        caps = session_state.get("capabilities") if isinstance(session_state.get("capabilities"), dict) else {}
+
+        return {
+            "data": {
+                "success": True,
+                "latency_ms": result.get("latency_ms"),
+                "error": None,
+                "capabilities": caps,
+                "tier": str(session_state.get("tier") or (_capabilities_to_tier(caps) if caps else "weak")),
+                "model_key": caps.get("probe_meta", {}).get("model_key") if isinstance(caps, dict) else None,
+                "probe_level": requested_probe_level,
+                "probed_at": caps.get("probe_meta", {}).get("probed_at") if isinstance(caps, dict) else None,
+                "probe_status": session_state.get("status"),
+                "probe_session_id": session.session_id,
+                "capability_saved": bool(session_state.get("capability_saved")),
+                "async": True,
+            }
+        }
     except Exception as exc:
         LOGGER.warning("LLM test failed: %s", exc)
         return {"data": {"success": False, "latency_ms": None, "error": f"LLM test failed: {type(exc).__name__}: {str(exc)[:200]}"}}
+
+
+@router.get("/llm/test/stream")
+async def stream_llm_test(
+    request: Request,
+    session_id: str = Query(..., min_length=8),
+    payload: dict = Depends(_get_settings_sse_payload),
+):
+    user_id = _payload_user_id(payload)
+    if user_id is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    session = _get_llm_probe_session_for_user(session_id, int(user_id))
+
+    async def _event_stream():
+        cursor = 0
+        last_heartbeat = time.monotonic()
+        snapshot = _llm_probe_session_snapshot(session)
+        yield _probe_sse_frame("session_state", snapshot)
+        while True:
+            with session.lock:
+                total = len(session.events)
+                pending = list(session.events[cursor:total])
+                status = session.status
+            for event_payload in pending:
+                cursor += 1
+                event_name = str(event_payload.get("event") or "message").strip() or "message"
+                yield _probe_sse_frame(event_name, event_payload)
+
+            if status in {"completed", "failed", "cancelled"} and cursor >= total:
+                break
+            if await request.is_disconnected():
+                break
+            now_monotonic = time.monotonic()
+            if (now_monotonic - last_heartbeat) >= _LLM_PROBE_SESSION_STREAM_HEARTBEAT_SECONDS:
+                yield ": keepalive\n\n"
+                last_heartbeat = now_monotonic
+            await asyncio.sleep(_LLM_PROBE_SESSION_STREAM_POLL_SECONDS)
+
+    return StreamingResponse(
+        _event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post("/llm/probe", response_model=dict)
+def trigger_llm_probe(
+    payload: dict = Depends(require_permission("settings", "update")),
+):
+    from services.llm_service import get_llm_config
+    from services.sql_routing.llm_capability import probe_and_save
+    cfg = get_llm_config()
+    try:
+        caps = probe_and_save(
+            cfg.get("provider", ""),
+            cfg.get("endpoint", ""),
+            cfg.get("model", ""),
+        )
+        return {
+            "data": {
+                "status": "completed",
+                "model_key": caps.get("probe_meta", {}).get("model_key"),
+                "probe_level": caps.get("probe_meta", {}).get("probe_level"),
+                "probed_at": caps.get("probe_meta", {}).get("probed_at"),
+                "tier": _capabilities_to_tier(caps),
+            }
+        }
+    except Exception as exc:
+        LOGGER.warning("LLM probe failed: %s", exc)
+        return {"data": {"status": "error", "error": str(exc)}}
+
+
+@router.get("/llm/probe", response_model=dict)
+def get_llm_probe_status(
+    payload: dict = Depends(require_permission("settings", "read")),
+):
+    from services.llm_service import get_llm_config
+    from services.sql_routing.llm_capability import get_model_capabilities
+    cfg = get_llm_config()
+    caps = get_model_capabilities(
+        cfg.get("provider", ""),
+        cfg.get("endpoint", ""),
+        cfg.get("model", ""),
+    )
+    return {
+        "data": {
+            "model_key": caps.get("probe_meta", {}).get("model_key"),
+            "probe_level": caps.get("probe_meta", {}).get("probe_level"),
+            "probed_at": caps.get("probe_meta", {}).get("probed_at"),
+            "tier": _capabilities_to_tier(caps),
+            "capabilities": caps,
+        }
+    }
+
+
+@router.get("/llm/probe/history", response_model=dict)
+def list_llm_probe_history(
+    payload: dict = Depends(require_permission("settings", "read")),
+):
+    from services.sql_routing.llm_capability import _list_all_capabilities
+    return {"data": {"models": _list_all_capabilities()}}
 
 
 ANTHROPIC_MODELS = [
@@ -704,43 +1332,10 @@ def update_general(
         "date_format": body.date_format,
         "session_timeout": body.session_timeout,
     }
-    timeout_settings_map = {
-        "request_timeout_ms": "timeout_request_ms",
-        "llm_connect_timeout_s": "timeout_llm_connect_s",
-        "llm_read_timeout_s": "timeout_llm_read_s",
-        "llm_write_timeout_s": "timeout_llm_write_s",
-        "llm_pool_timeout_s": "timeout_llm_pool_s",
-        "db_connect_timeout_s": "timeout_db_connect_s",
-        "model_list_timeout_s": "timeout_model_list_s",
-    }
-    router_runtime_map = {
-        "route_observability_persist_enabled": "router_route_observability_persist_enabled",
-        "route_observability_persist_interval_seconds": "router_route_observability_persist_interval_seconds",
-        "route_observability_persist_event_delta": "router_route_observability_persist_event_delta",
-        "model_ref_case_sensitive": "router_model_ref_case_sensitive",
-    }
-    for field_name, setting_key in timeout_settings_map.items():
-        value = getattr(body, field_name, None)
-        if value is not None:
-            mapping[setting_key] = value
-            updated_fields.append(field_name)
-    refresh_runtime_router = False
-    for field_name, setting_key in router_runtime_map.items():
-        value = getattr(body, field_name, None)
-        if value is not None:
-            mapping[setting_key] = value
-            updated_fields.append(field_name)
-            refresh_runtime_router = True
-    if body.route_observability_window_minutes is not None:
-        mapping["router_route_observability_window_seconds"] = int(body.route_observability_window_minutes) * 60
-        updated_fields.append("route_observability_window_minutes")
-        refresh_runtime_router = True
     if not any(value is not None for value in mapping.values()):
         raise HTTPException(status_code=400, detail="No fields to update")
     with connection_lock():
         _upsert_settings(get_connection(), mapping)
-    if refresh_runtime_router:
-        _refresh_runtime_router_settings()
     _audit_settings_update(payload, "general", updated_fields)
     return {"data": {"success": True}}
 
@@ -787,51 +1382,8 @@ def update_recommender_settings(
     return {"data": {"success": True}}
 
 
-TIMEOUT_MAP = {
-    "request_timeout_ms": "timeout_request_ms",
-    "llm_connect_timeout_s": "timeout_llm_connect_s",
-    "llm_read_timeout_s": "timeout_llm_read_s",
-    "llm_write_timeout_s": "timeout_llm_write_s",
-    "llm_pool_timeout_s": "timeout_llm_pool_s",
-    "db_connect_timeout_s": "timeout_db_connect_s",
-    "model_list_timeout_s": "timeout_model_list_s",
-}
 
 
-@router.get("/timeouts", response_model=dict)
-def get_timeout_settings(
-    payload: dict = Depends(require_permission("settings", "read")),
-):
-    with connection_lock():
-        con = get_connection()
-        rows = con.execute(
-            "SELECT key, value FROM metadata.settings WHERE key LIKE 'timeout_%'"
-        ).fetchall()
-        db_vals = {r[0]: _json_value(r[0], r[1]) for r in rows}
-    result = {}
-    for field_name, setting_key in TIMEOUT_MAP.items():
-        result[field_name] = db_vals.get(setting_key)
-    return {"data": result}
-
-
-@router.put("/timeouts", response_model=dict)
-def update_timeout_settings(
-    body: TimeoutUpdate,
-    payload: dict = Depends(require_permission("settings", "update")),
-):
-    mapping = {}
-    updated_fields: list[str] = []
-    for field_name, setting_key in TIMEOUT_MAP.items():
-        value = getattr(body, field_name, None)
-        if value is not None:
-            mapping[setting_key] = value
-            updated_fields.append(field_name)
-    if not mapping:
-        raise HTTPException(status_code=400, detail="No fields to update")
-    with connection_lock():
-        _upsert_settings(get_connection(), mapping)
-    _audit_settings_update(payload, "timeouts", updated_fields)
-    return {"data": {"success": True}}
 
 
 LLM_ADVANCED_MAP = {
@@ -907,7 +1459,7 @@ def get_ask_settings(
 ):
     with connection_lock():
         con = get_connection()
-        rows = con.execute("SELECT key, value FROM metadata.settings WHERE key LIKE 'ask_%' OR key LIKE 'router_%'").fetchall()
+        rows = con.execute("SELECT key, value FROM metadata.settings WHERE key LIKE 'ask_%' OR key LIKE 'router_%' OR key LIKE 'timeout_%'").fetchall()
         db_vals = {r[0]: _json_value(r[0], r[1]) for r in rows}
     runtime_snapshot: dict[str, object] = {}
     try:
@@ -982,6 +1534,17 @@ ROUTER_SETTINGS_MAP = {
     "decompose_merge_circuit_enabled": "router_decompose_merge_circuit_enabled",
     "decompose_merge_failure_threshold": "router_decompose_merge_failure_threshold",
     "decompose_merge_disable_seconds": "router_decompose_merge_disable_seconds",
+    "decompose_merge_stage_budget_s": "router_decompose_merge_stage_budget_s",
+    "sql_generation_total_budget_s": "router_sql_generation_total_budget_s",
+    "sql_generation_timeout_cap_s": "router_sql_generation_timeout_cap_s",
+    "sql_generation_timeout_min_s": "router_sql_generation_timeout_min_s",
+    "json_reask_timeout_cap_s": "router_json_reask_timeout_cap_s",
+    "json_reask_timeout_min_s": "router_json_reask_timeout_min_s",
+    "llm_sub_query_timeout_s": "router_llm_sub_query_timeout_s",
+    "llm_merge_timeout_s": "router_llm_merge_timeout_s",
+    "duckdb_did_you_mean_fix_enabled": "router_duckdb_did_you_mean_fix_enabled",
+    "duckdb_did_you_mean_allow_internal_tables": "router_duckdb_did_you_mean_allow_internal_tables",
+    "duckdb_did_you_mean_max_retries": "router_duckdb_did_you_mean_max_retries",
     "external_connection_pool_enabled": "router_external_connection_pool_enabled",
     "external_connection_pool_max_per_key": "router_external_connection_pool_max_per_key",
     "external_connection_pool_idle_seconds": "router_external_connection_pool_idle_seconds",
@@ -996,6 +1559,22 @@ ROUTER_SETTINGS_MAP = {
     "route_observability_strategy_trend_max_points": "router_route_observability_strategy_trend_max_points",
     "route_observability_strategy_trend_persist_interval_seconds": "router_route_observability_strategy_trend_persist_interval_seconds",
     "route_observability_strategy_trend_persist_decision_delta": "router_route_observability_strategy_trend_persist_decision_delta",
+    "route_alert_repair_timeout_short_circuit_warning_rate": "router_route_alert_repair_timeout_short_circuit_warning_rate",
+    "route_alert_repair_timeout_short_circuit_critical_rate": "router_route_alert_repair_timeout_short_circuit_critical_rate",
+    "route_alert_repair_timeout_short_circuit_min_warning_events": "router_route_alert_repair_timeout_short_circuit_min_warning_events",
+    "route_alert_repair_timeout_short_circuit_min_critical_events": "router_route_alert_repair_timeout_short_circuit_min_critical_events",
+    "route_alert_repair_budget_low_short_circuit_warning_rate": "router_route_alert_repair_budget_low_short_circuit_warning_rate",
+    "route_alert_repair_budget_low_short_circuit_critical_rate": "router_route_alert_repair_budget_low_short_circuit_critical_rate",
+    "route_alert_repair_budget_low_short_circuit_min_warning_events": "router_route_alert_repair_budget_low_short_circuit_min_warning_events",
+    "route_alert_repair_budget_low_short_circuit_min_critical_events": "router_route_alert_repair_budget_low_short_circuit_min_critical_events",
+    "route_alert_json_reask_warning_rate": "router_route_alert_json_reask_warning_rate",
+    "route_alert_json_reask_critical_rate": "router_route_alert_json_reask_critical_rate",
+    "route_alert_json_reask_min_warning_decisions": "router_route_alert_json_reask_min_warning_decisions",
+    "route_alert_json_reask_min_critical_decisions": "router_route_alert_json_reask_min_critical_decisions",
+    "route_alert_decompose_cancelled_warning_rate": "router_route_alert_decompose_cancelled_warning_rate",
+    "route_alert_decompose_cancelled_critical_rate": "router_route_alert_decompose_cancelled_critical_rate",
+    "route_alert_decompose_cancelled_min_warning_events": "router_route_alert_decompose_cancelled_min_warning_events",
+    "route_alert_decompose_cancelled_min_critical_events": "router_route_alert_decompose_cancelled_min_critical_events",
     "sql_route_v2_enabled": "router_sql_route_v2_enabled",
     "sql_route_allowlist_projects": "router_sql_route_allowlist_projects",
     "sql_route_shadow_mode": "router_sql_route_shadow_mode",
@@ -1004,6 +1583,13 @@ ROUTER_SETTINGS_MAP = {
     "sql_route_profile_id": "router_sql_route_profile_id",
     "sql_route_profile_version": "router_sql_route_profile_version",
     "sql_route_strict_json_probe_enabled": "router_sql_route_strict_json_probe_enabled",
+    "request_timeout_ms": "timeout_request_ms",
+    "llm_connect_timeout_s": "timeout_llm_connect_s",
+    "llm_read_timeout_s": "timeout_llm_read_s",
+    "llm_write_timeout_s": "timeout_llm_write_s",
+    "llm_pool_timeout_s": "timeout_llm_pool_s",
+    "db_connect_timeout_s": "timeout_db_connect_s",
+    "model_list_timeout_s": "timeout_model_list_s",
 }
 
 
@@ -1013,7 +1599,7 @@ def get_router_settings(
 ):
     with connection_lock():
         con = get_connection()
-        rows = con.execute("SELECT key, value FROM metadata.settings WHERE key LIKE 'router_%'").fetchall()
+        rows = con.execute("SELECT key, value FROM metadata.settings WHERE key LIKE 'router_%' OR key LIKE 'timeout_%'").fetchall()
         db_vals = {r[0]: _json_value(r[0], r[1]) for r in rows}
     runtime_router_config: dict[str, object] = {}
     try:

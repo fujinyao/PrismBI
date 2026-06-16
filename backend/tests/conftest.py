@@ -411,6 +411,27 @@ def _create_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """)
 
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS metadata.llm_capabilities (
+            provider VARCHAR NOT NULL,
+            endpoint VARCHAR NOT NULL,
+            model VARCHAR NOT NULL,
+            model_family VARCHAR,
+            model_tier VARCHAR,
+            structured_output JSON,
+            sql_quality JSON,
+            instruction JSON,
+            repair JSON,
+            performance JSON,
+            probe_level VARCHAR DEFAULT 'keyword_only',
+            probe_count INTEGER DEFAULT 0,
+            probed_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (provider, endpoint, model)
+        )
+    """)
+
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS metadata.recommended_questions_cache (
             id INTEGER PRIMARY KEY,
             project_id INTEGER NOT NULL REFERENCES metadata.projects(id),
@@ -601,6 +622,11 @@ def _seed_test_settings(conn: duckdb.DuckDBPyConnection) -> None:
         "router_decompose_merge_circuit_enabled": "true",
         "router_decompose_merge_failure_threshold": "1",
         "router_decompose_merge_disable_seconds": "3600",
+        "router_decompose_merge_stage_budget_s": "60",
+        "router_sql_generation_total_budget_s": "300",
+        "router_duckdb_did_you_mean_fix_enabled": "true",
+        "router_duckdb_did_you_mean_allow_internal_tables": "false",
+        "router_duckdb_did_you_mean_max_retries": "1",
         "router_external_connection_pool_enabled": "true",
         "router_external_connection_pool_max_per_key": "4",
         "router_external_connection_pool_idle_seconds": "300",
@@ -665,10 +691,23 @@ def seed_user(test_db) -> dict:
     from db import _assign_role_to_user
     from services.auth_service import AuthService
 
-    row = test_db.execute("SELECT id, username FROM metadata.users WHERE username = 'testuser'").fetchone()
-    if row:
-        user_id = int(row[0])
-    else:
+    def _fetchone_isolated(sql: str, params: list | None = None):
+        cursor = test_db.cursor()
+        try:
+            if params is None:
+                return cursor.execute(sql).fetchone()
+            return cursor.execute(sql, params).fetchone()
+        finally:
+            cursor.close()
+
+    row = _fetchone_isolated("SELECT id, username FROM metadata.users WHERE username = 'testuser'")
+    user_id: int | None = None
+    if row and len(row) >= 2 and str(row[1]) == "testuser":
+        try:
+            user_id = int(row[0])
+        except (TypeError, ValueError):
+            user_id = None
+    if user_id is None:
         user_id = 1
         password_hash = AuthService(secret_key="test-only").hash_password("password123")
         test_db.execute(
@@ -679,7 +718,7 @@ def seed_user(test_db) -> dict:
             [user_id, password_hash],
         )
 
-    role = test_db.execute("SELECT id FROM metadata.roles WHERE name = 'super_admin'").fetchone()
+    role = _fetchone_isolated("SELECT id FROM metadata.roles WHERE name = 'super_admin'")
     if role:
         _assign_role_to_user(test_db, user_id, int(role[0]), granted_by=user_id)
 
@@ -688,7 +727,11 @@ def seed_user(test_db) -> dict:
 
 @pytest.fixture
 def seed_project(test_db, seed_user: dict) -> dict:
-    row = test_db.execute("SELECT id, name FROM metadata.projects WHERE id = 1").fetchone()
+    cursor = test_db.cursor()
+    try:
+        row = cursor.execute("SELECT id, name FROM metadata.projects WHERE id = 1").fetchone()
+    finally:
+        cursor.close()
     if not row:
         test_db.execute(
             """

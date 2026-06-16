@@ -16,6 +16,50 @@ class TestAsk:
         assert len(chunks[0]) == 80
         assert len(chunks[1]) == 70
 
+    def test_ask_stream_result_payload_compacts_non_temporary(self, monkeypatch):
+        from routers import ask as ask_router
+
+        monkeypatch.setattr(ask_router, "_STREAM_COMPACT_RESULT", True)
+        payload = ask_router._stream_result_payload(
+            {
+                "thread_id": 321,
+                "summary": "ready",
+                "sql": "SELECT 1",
+                "response": {
+                    "id": 77,
+                    "created_at": "2026-06-10T00:00:00Z",
+                    "askingTask": {"type": "GENERAL"},
+                },
+            },
+            temporary=False,
+        )
+
+        assert payload["compact_result"] is True
+        assert payload["response"] is None
+        assert payload["response_id"] == 77
+        assert payload["summary"] == "ready"
+
+    def test_ask_stream_result_payload_keeps_full_data_for_temporary(self, monkeypatch):
+        from routers import ask as ask_router
+
+        monkeypatch.setattr(ask_router, "_STREAM_COMPACT_RESULT", True)
+        payload = ask_router._stream_result_payload(
+            {
+                "thread_id": 321,
+                "summary": "ready",
+                "sql": "SELECT 1",
+                "response": {
+                    "id": 77,
+                    "askingTask": {"type": "GENERAL"},
+                },
+            },
+            temporary=True,
+        )
+
+        assert payload["response"] is not None
+        assert payload["response"]["id"] == 77
+        assert payload.get("compact_result") is None
+
     def test_ask_question_without_active_project_requires_temporary(self, test_app: TestClient, auth_headers: dict):
         response = test_app.post(
             "/api/ask",
@@ -115,6 +159,114 @@ class TestAsk:
             assert result_payload is not None
             assert "GROUP BY t.product_category_name_english, s.seller_city" in result_payload["sql"]
             assert result_payload["response"]["askingTask"]["type"] == "NL2SQL"
+
+    def test_ask_stream_events_include_sequence_and_timing_metadata(self, test_app: TestClient, auth_headers: dict, monkeypatch):
+        from routers import ask as ask_router
+
+        def fake_run_ask_question(*args, **kwargs):
+            return {
+                "thread_id": 3555,
+                "summary": "sse metadata check",
+                "sql": "SELECT 1",
+                "response": {
+                    "id": 3555,
+                    "question": "Hello",
+                    "sql": "SELECT 1",
+                    "askingTask": {"type": "GENERAL", "status": "FINISHED"},
+                },
+            }
+
+        monkeypatch.setattr(ask_router, "run_ask_question", fake_run_ask_question)
+
+        with test_app.stream(
+            "POST",
+            "/api/ask/stream",
+            json={"question": "Hello", "temporary": True, "client_request_id": "sse-meta-r1"},
+            headers=auth_headers,
+        ) as response:
+            assert response.status_code == 200
+            seq_values: list[int] = []
+            got_result = False
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                if isinstance(line, bytes):
+                    line = line.decode("utf-8", errors="ignore")
+                if not line.startswith("data: "):
+                    continue
+                import json as _json
+
+                payload = _json.loads(line[len("data: "):])
+                if payload.get("type") not in {"delta", "result"}:
+                    continue
+                assert payload.get("request_id") == "sse-meta-r1"
+                assert isinstance(payload.get("seq"), int)
+                assert isinstance(payload.get("ts"), int)
+                assert isinstance(payload.get("elapsed_ms"), int)
+                seq_values.append(int(payload["seq"]))
+                if payload.get("type") == "result":
+                    got_result = True
+                    break
+
+            assert got_result
+            assert len(seq_values) >= 2
+            assert seq_values == sorted(seq_values)
+
+    def test_ask_stream_step_detail_is_truncated_for_long_reasoning(self, test_app: TestClient, auth_headers: dict, monkeypatch):
+        from routers import ask as ask_router
+        from services.step_progress import _STEP_DETAIL_MAX_CHARS
+
+        long_reasoning = "S" * 1500
+
+        def fake_run_ask_question(*args, **kwargs):
+            progress_cb = kwargs.get("progress_cb")
+            if progress_cb:
+                progress_cb("understand", "understand")
+                progress_cb("organize", long_reasoning)
+                progress_cb("answer", "answer")
+            return {
+                "thread_id": 4555,
+                "summary": "done",
+                "sql": "SELECT 1",
+                "response": {
+                    "id": 4555,
+                    "question": "Hello",
+                    "sql": "SELECT 1",
+                    "askingTask": {"type": "GENERAL", "status": "FINISHED"},
+                },
+            }
+
+        monkeypatch.setattr(ask_router, "run_ask_question", fake_run_ask_question)
+
+        with test_app.stream(
+            "POST",
+            "/api/ask/stream",
+            json={"question": "Hello", "temporary": True, "client_request_id": "sse-step-cap-r1"},
+            headers=auth_headers,
+        ) as response:
+            assert response.status_code == 200
+            organize_detail = None
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                if isinstance(line, bytes):
+                    line = line.decode("utf-8", errors="ignore")
+                if not line.startswith("data: "):
+                    continue
+                import json as _json
+
+                payload = _json.loads(line[len("data: "):])
+                if payload.get("type") == "delta" and payload.get("content_type") == "step":
+                    step_payload = _json.loads(str(payload.get("content") or "{}"))
+                    if step_payload.get("key") == "organize":
+                        organize_detail = str(step_payload.get("detail") or "")
+                if payload.get("type") == "result":
+                    break
+
+        assert organize_detail is not None
+        if _STEP_DETAIL_MAX_CHARS > 0:
+            assert len(organize_detail) <= _STEP_DETAIL_MAX_CHARS
+            assert organize_detail.endswith("...")
 
     def test_ask_stream_handles_requested_department_title_salary_question(self, test_app: TestClient, auth_headers: dict, monkeypatch):
         from routers import ask as ask_router

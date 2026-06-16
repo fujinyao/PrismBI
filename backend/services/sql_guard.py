@@ -1,14 +1,9 @@
 from __future__ import annotations
 
-import re
+from typing import Any, Optional
 
 import sqlglot
 from sqlglot import exp
-
-FORBIDDEN_KEYWORDS = re.compile(
-    r"\b(attach|detach|pragma|install|vacuum|checkpoint|force|grant|revoke)\b",
-    re.IGNORECASE,
-)
 
 READ_ONLY_ROOTS = (exp.Select, exp.Union, exp.Except, exp.Intersect)
 FORBIDDEN_EXPRESSIONS = (
@@ -117,6 +112,25 @@ def normalize_read_only_sql(sql: str, dialect: str = "duckdb") -> str:
     normalized = (sql or "").strip()
     if not normalized:
         raise ValueError("SQL is required.")
+
+    try:
+        from services.llm_service import get_llm_config
+        from services.sql_routing.llm_capability import get_model_capabilities, _capabilities_to_tier
+        llm_cfg = get_llm_config()
+        if llm_cfg.get("model"):
+            caps = get_model_capabilities(
+                llm_cfg.get("provider", ""),
+                llm_cfg.get("endpoint", ""),
+                llm_cfg.get("model", ""),
+            )
+            tier = _capabilities_to_tier(caps)
+            precheck_error = fast_precheck_bad_sql(normalized, tier, caps)
+            if precheck_error:
+                raise ValueError(f"SQL pre-check failed: {precheck_error}")
+    except ValueError:
+        raise
+    except Exception:
+        pass
     has_inner_semicolon = _has_semicolon_outside_strings(normalized.rstrip(";"))
     if not has_inner_semicolon:
         statements = _parse_sql_statements(normalized, dialect)
@@ -187,3 +201,8 @@ def _function_name(node: exp.Expression) -> str | None:
     if isinstance(node, exp.Func):
         return str(node.sql_name() or "").lower()
     return None
+
+
+def fast_precheck_bad_sql(sql: str, tier: str = "weak", capabilities: Optional[dict] = None) -> Optional[str]:
+    from services.sql_routing.llm_capability import _fast_precheck_bad_sql as _check
+    return _check(sql, tier, capabilities or {})

@@ -34,12 +34,52 @@ def _coerce_stream_int_env(name: str, default: int, minimum: int, maximum: int) 
     return value
 
 
+def _stream_env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
 _STREAM_MIN_CHARS = _coerce_stream_int_env("PRISMBI_ASK_STREAM_MIN_CHARS", 48, 20, 400)
 _STREAM_MAX_CHARS = _coerce_stream_int_env("PRISMBI_ASK_STREAM_MAX_CHARS", 80, 20, 800)
 if _STREAM_MAX_CHARS < _STREAM_MIN_CHARS:
     _STREAM_MAX_CHARS = _STREAM_MIN_CHARS
 _STREAM_FLUSH_MS = _coerce_stream_int_env("PRISMBI_ASK_STREAM_FLUSH_MS", 40, 0, 2000)
 _STREAM_FLUSH_SECONDS = float(_STREAM_FLUSH_MS) / 1000.0
+_STREAM_RUNNING_HEARTBEAT_MS = _coerce_stream_int_env(
+    "PRISMBI_ASK_STREAM_RUNNING_HEARTBEAT_MS",
+    5000,
+    0,
+    60000,
+)
+_STREAM_RUNNING_HEARTBEAT_SECONDS = float(_STREAM_RUNNING_HEARTBEAT_MS) / 1000.0
+_STREAM_RUNNING_HEARTBEAT_LONG_MS = _coerce_stream_int_env(
+    "PRISMBI_ASK_STREAM_RUNNING_HEARTBEAT_LONG_MS",
+    15000,
+    5000,
+    120000,
+)
+_STREAM_RUNNING_HEARTBEAT_LONG_SECONDS = float(_STREAM_RUNNING_HEARTBEAT_LONG_MS) / 1000.0
+_STREAM_RUNNING_HEARTBEAT_LONG_AFTER_MS = _coerce_stream_int_env(
+    "PRISMBI_ASK_STREAM_RUNNING_HEARTBEAT_LONG_AFTER_MS",
+    120000,
+    30000,
+    600000,
+)
+_STREAM_RUNNING_HEARTBEAT_LONG_AFTER_SECONDS = float(_STREAM_RUNNING_HEARTBEAT_LONG_AFTER_MS) / 1000.0
+
+def _stream_heartbeat_interval(elapsed: float) -> float:
+    if _STREAM_RUNNING_HEARTBEAT_LONG_AFTER_SECONDS > 0:
+        if elapsed > _STREAM_RUNNING_HEARTBEAT_LONG_AFTER_SECONDS + 270:
+            return _STREAM_RUNNING_HEARTBEAT_LONG_SECONDS * 3  # 45s after 390s
+        if elapsed > _STREAM_RUNNING_HEARTBEAT_LONG_AFTER_SECONDS + 150:
+            return _STREAM_RUNNING_HEARTBEAT_LONG_SECONDS * 2  # 30s after 270s
+        if elapsed > _STREAM_RUNNING_HEARTBEAT_LONG_AFTER_SECONDS:
+            return _STREAM_RUNNING_HEARTBEAT_LONG_SECONDS  # 15s after 120s
+    return _STREAM_RUNNING_HEARTBEAT_SECONDS  # 5s initially
+
+_STREAM_COMPACT_RESULT = _stream_env_flag("PRISMBI_ASK_STREAM_COMPACT_RESULT", default=True)
 _CHUNK_BOUNDARY_CHARS = frozenset(
     {
         " ",
@@ -84,6 +124,26 @@ def _chunk_text(text: str, min_chars: int = _STREAM_MIN_CHARS, max_chars: int = 
     if buffer:
         chunks.append("".join(buffer))
     return chunks
+
+
+def _stream_result_payload(result: dict, *, temporary: bool) -> dict:
+    payload = result if isinstance(result, dict) else {}
+    if not _STREAM_COMPACT_RESULT or temporary:
+        return payload
+
+    response = payload.get("response") if isinstance(payload.get("response"), dict) else {}
+    compact_payload = {
+        "thread_id": payload.get("thread_id"),
+        "summary": payload.get("summary", "") or "",
+        "sql": payload.get("sql", "") or "",
+        "response": None,
+        "compact_result": True,
+    }
+    if response.get("id") is not None:
+        compact_payload["response_id"] = response["id"]
+    if response.get("created_at") is not None:
+        compact_payload["response_created_at"] = response["created_at"]
+    return compact_payload
 
 router = APIRouter()
 _bearer = HTTPBearer(auto_error=False)
@@ -138,7 +198,7 @@ def ask_question(body: AskRequest, payload: dict = Depends(get_current_user)):
     request_id = body.client_request_id or f"http-{uuid.uuid4().hex[:12]}"
     client_request_id = body.client_request_id or request_id
     LOGGER.info(
-        "Ask HTTP start request_id=%s thread_id=%s client_request_id=%s",
+        "Ask transport start transport=http request_id=%s thread_id=%s client_request_id=%s",
         request_id,
         body.thread_id,
         client_request_id,
@@ -161,7 +221,7 @@ def ask_question(body: AskRequest, payload: dict = Depends(get_current_user)):
                 raise
             handle.complete_success(data)
             LOGGER.info(
-                "Ask HTTP owner completed request_id=%s thread_id=%s client_request_id=%s",
+                "Ask transport completed transport=http request_id=%s thread_id=%s client_request_id=%s",
                 request_id,
                 body.thread_id,
                 client_request_id,
@@ -227,9 +287,22 @@ async def ask_stream_sse(body: AskRequest, payload: dict = Depends(_get_sse_user
         handle = acquire_ask_idempotency(body.thread_id, client_request_id)
         disconnected = False
         future: asyncio.Future | None = None
+        ask_started_at = time.monotonic()
+        seq = 0
+
+        def _sse_frame(payload: dict) -> str:
+            nonlocal seq
+            seq += 1
+            enriched = dict(payload)
+            enriched["request_id"] = request_id
+            enriched["seq"] = seq
+            enriched["ts"] = int(time.time() * 1000)
+            enriched["elapsed_ms"] = int(max(0.0, (time.monotonic() - ask_started_at) * 1000.0))
+            return f"data: {json.dumps(enriched)}\n\n"
+
         try:
             LOGGER.info(
-                "Ask SSE start request_id=%s thread_id=%s client_request_id=%s role=%s enabled=%s",
+                "Ask transport start transport=sse request_id=%s thread_id=%s client_request_id=%s role=%s enabled=%s",
                 request_id,
                 body.thread_id,
                 client_request_id,
@@ -237,7 +310,7 @@ async def ask_stream_sse(body: AskRequest, payload: dict = Depends(_get_sse_user
                 handle.enabled,
             )
             step_queue: asyncio.Queue = asyncio.Queue(maxsize=50)
-            yield f"data: {json.dumps({'type': 'delta', 'content_type': 'state', 'content': 'running'})}\n\n"
+            yield _sse_frame({"type": "delta", "content_type": "state", "content": "running"})
             last_state_emit = time.monotonic()
 
             loop = asyncio.get_running_loop()
@@ -263,36 +336,29 @@ async def ask_stream_sse(body: AskRequest, payload: dict = Depends(_get_sse_user
                         step = await asyncio.wait_for(step_queue.get(), timeout=0.2)
                     except asyncio.TimeoutError:
                         now = time.monotonic()
-                        if now - last_state_emit >= 5.0:
-                            yield f"data: {json.dumps({'type': 'delta', 'content_type': 'state', 'content': 'running'})}\n\n"
+                        heartbeat_interval = _stream_heartbeat_interval(now - ask_started_at)
+                        if heartbeat_interval > 0 and now - last_state_emit >= heartbeat_interval:
+                            yield _sse_frame({"type": "delta", "content_type": "state", "content": "running"})
                             last_state_emit = now
                         continue
                     if step is None:
                         break
-                    yield f"data: {json.dumps({'type': 'delta', 'content_type': 'step', 'content': json.dumps(step)})}\n\n"
+                    yield _sse_frame(
+                        {
+                            "type": "delta",
+                            "content_type": "step",
+                            "content": json.dumps(step),
+                        }
+                    )
 
                 data = await future
+                await progress_cb.flush_async(timeout=0.25)
             except asyncio.CancelledError:
                 disconnected = True
-                if future is not None:
-                    def _consume_background_exception(done_future: asyncio.Future) -> None:
-                        try:
-                            done_future.result()
-                        except Exception:
-                            LOGGER.debug(
-                                "Ask SSE background future finished after disconnect request_id=%s thread_id=%s client_request_id=%s",
-                                request_id,
-                                body.thread_id,
-                                client_request_id,
-                                exc_info=True,
-                            )
-
-                    if future.done():
-                        _consume_background_exception(future)
-                    else:
-                        future.add_done_callback(_consume_background_exception)
+                if future is not None and not future.done():
+                    future.cancel()
                 LOGGER.warning(
-                    "Ask SSE cancelled request_id=%s thread_id=%s client_request_id=%s",
+                    "Ask transport cancelled transport=sse request_id=%s thread_id=%s client_request_id=%s",
                     request_id,
                     body.thread_id,
                     client_request_id,
@@ -300,42 +366,42 @@ async def ask_stream_sse(body: AskRequest, payload: dict = Depends(_get_sse_user
                 raise
             except AskCancelledError as exc:
                 LOGGER.warning(
-                    "Ask SSE request cancelled request_id=%s thread_id=%s client_request_id=%s detail=%s",
+                    "Ask transport cancelled transport=sse request_id=%s thread_id=%s client_request_id=%s detail=%s",
                     request_id,
                     body.thread_id,
                     client_request_id,
                     str(exc),
                 )
-                yield f"data: {json.dumps({'type': 'error', 'message': str(exc) or 'Ask request cancelled'})}\n\n"
+                yield _sse_frame({"type": "error", "message": str(exc) or "Ask request cancelled"})
                 return
             except ValueError as exc:
                 detail = str(exc)
                 if "Ask request cancelled" in detail:
                     LOGGER.warning(
-                        "Ask SSE request cancelled via value error request_id=%s thread_id=%s client_request_id=%s detail=%s",
+                        "Ask transport cancelled transport=sse request_id=%s thread_id=%s client_request_id=%s detail=%s",
                         request_id,
                         body.thread_id,
                         client_request_id,
                         detail,
                     )
-                    yield f"data: {json.dumps({'type': 'error', 'message': detail})}\n\n"
+                    yield _sse_frame({"type": "error", "message": detail})
                     return
                 LOGGER.warning(
-                    "Ask SSE validation error request_id=%s thread_id=%s client_request_id=%s",
+                    "Ask transport validation_error transport=sse request_id=%s thread_id=%s client_request_id=%s",
                     request_id,
                     body.thread_id,
                     client_request_id,
                 )
-                yield f"data: {json.dumps({'type': 'error', 'message': 'Invalid request parameters'})}\n\n"
+                yield _sse_frame({"type": "error", "message": "Invalid request parameters"})
                 return
             except Exception:
                 LOGGER.exception(
-                    "Ask SSE failed request_id=%s thread_id=%s client_request_id=%s",
+                    "Ask transport failed transport=sse request_id=%s thread_id=%s client_request_id=%s",
                     request_id,
                     body.thread_id,
                     client_request_id,
                 )
-                yield f"data: {json.dumps({'type': 'error', 'message': 'An internal error occurred during processing'})}\n\n"
+                yield _sse_frame({"type": "error", "message": "An internal error occurred during processing"})
                 return
 
             while not step_queue.empty():
@@ -343,28 +409,38 @@ async def ask_stream_sse(body: AskRequest, payload: dict = Depends(_get_sse_user
                     step = step_queue.get_nowait()
                     if step is None:
                         break
-                    yield f"data: {json.dumps({'type': 'delta', 'content_type': 'step', 'content': json.dumps(step)})}\n\n"
+                    yield _sse_frame(
+                        {
+                            "type": "delta",
+                            "content_type": "step",
+                            "content": json.dumps(step),
+                        }
+                    )
                 except asyncio.QueueEmpty:
                     break
 
             answer = data.get("summary", "") or ""
-            sql = data.get("sql", "") or ""
-            summary = answer
+            result_payload = _stream_result_payload(data, temporary=bool(body.temporary))
 
             if answer:
                 chunks = _chunk_text(answer)
                 for i, chunk in enumerate(chunks):
-                    yield f"data: {json.dumps({'type': 'delta', 'content_type': 'text', 'content': chunk})}\n\n"
+                    yield _sse_frame({"type": "delta", "content_type": "text", "content": chunk})
                     if i < len(chunks) - 1 and _STREAM_FLUSH_SECONDS > 0:
                         await asyncio.sleep(_STREAM_FLUSH_SECONDS)
 
-            response_data = data.get("response") or {}
-            yield f"data: {json.dumps({'type': 'result', 'data': {'sql': sql, 'summary': summary, 'answer': answer, 'thread_id': data.get('thread_id'), 'response': response_data}})}\n\n"
+            yield _sse_frame(
+                {
+                    "type": "result",
+                    "data": result_payload,
+                }
+            )
             LOGGER.info(
-                "Ask SSE completed request_id=%s thread_id=%s client_request_id=%s",
+                "Ask transport completed transport=sse request_id=%s thread_id=%s client_request_id=%s compact=%s",
                 request_id,
                 body.thread_id,
                 client_request_id,
+                bool(result_payload.get("compact_result")),
             )
         finally:
             handle.release(disconnected=disconnected)

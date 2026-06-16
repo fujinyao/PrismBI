@@ -24,6 +24,17 @@ def _env_flag(name: str, *, default: bool = False) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_float(name: str, *, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return float(default)
+    try:
+        value = float(str(raw).strip())
+    except Exception:
+        return float(default)
+    return max(0.0, value)
+
+
 def build_log_config(prod: bool) -> dict[str, Any]:
     log_config = copy.deepcopy(UVICORN_LOGGING_CONFIG)
     loggers = log_config.setdefault("loggers", {})
@@ -69,6 +80,8 @@ def main():
 
     env = "production" if args.prod else "development"
     os.environ.setdefault("ENV", env)
+    ws_ping_interval = _env_float("PRISMBI_WS_PING_INTERVAL", default=20.0)
+    ws_ping_timeout = _env_float("PRISMBI_WS_PING_TIMEOUT", default=20.0)
 
     uvicorn.run(
         "main:app",
@@ -78,6 +91,8 @@ def main():
         log_level="info" if args.prod else "debug",
         env_file=".env" if not args.prod else None,
         log_config=build_log_config(args.prod),
+        ws_ping_interval=ws_ping_interval,
+        ws_ping_timeout=ws_ping_timeout,
     )
 
 

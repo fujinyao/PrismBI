@@ -11,6 +11,8 @@ import {
   normalizeStrategyTrendHistory,
   normalizeQueryMetricsRows,
   queryMetricsQueryKey,
+  summarizeRoutePathologies,
+  summarizeRouteRepairObservability,
   summarizeStrategyTrend,
   summarizeStrategyObservability,
 } from '@/lib/queryMetrics'
@@ -100,6 +102,12 @@ function topCounterEntries(counter: Record<string, number> | undefined, limit = 
 
 function prettifyCounterKey(value: string): string {
   return value.replace(/_/g, ' ')
+}
+
+function prettifyTransitionKey(value: string): string {
+  const [from, to] = value.split('->')
+  if (!from || !to) return prettifyCounterKey(value)
+  return `${prettifyCounterKey(from)} -> ${prettifyCounterKey(to)}`
 }
 
 function alertTone(level: 'warning' | 'critical'): string {
@@ -212,9 +220,21 @@ export function ExecutionHealthPanel({ projectId, className }: ExecutionHealthPa
     () => topCounterEntries(routeDimensions?.repair_short_circuit_reason, 1)[0],
     [routeDimensions?.repair_short_circuit_reason],
   )
+  const topDecomposeStageReason = useMemo(
+    () => topCounterEntries(routeDimensions?.decompose_stage_reason, 1)[0],
+    [routeDimensions?.decompose_stage_reason],
+  )
   const generationDecisionTotal = Math.max(
     toSafeCount(routeDimensions?.generation_decision_total),
     sumCounterValues(routeDimensions?.generation_engine),
+  )
+  const routeRepairSummary = useMemo(
+    () => summarizeRouteRepairObservability(routeDimensions),
+    [routeDimensions],
+  )
+  const routePathologySummary = useMemo(
+    () => summarizeRoutePathologies(routeDimensions),
+    [routeDimensions],
   )
   const schemaLinkFallbackTotal = resolveFallbackTotal(
     routeDimensions?.schema_link_fallback_total,
@@ -258,6 +278,11 @@ export function ExecutionHealthPanel({ projectId, className }: ExecutionHealthPa
     () => topCounterEntries(routeDimensions?.final_answer_fallback_reason, 3),
     [routeDimensions?.final_answer_fallback_reason],
   )
+  const topValidationIssueTransition = routePathologySummary.validationIssueTransitions[0]
+  const topFallbackChainPattern = routePathologySummary.fallbackChainPatterns[0]
+  const topFallbackChainStep = routePathologySummary.fallbackChainSteps[0]
+  const topRepairIssueBucket = routePathologySummary.repairShortCircuitIssueBuckets[0]
+  const topRepairDominantIssueBucket = routePathologySummary.repairShortCircuitDominantIssueBuckets[0]
   const strategySummary = useMemo(
     () => summarizeStrategyObservability(routeDimensions),
     [routeDimensions],
@@ -428,6 +453,7 @@ export function ExecutionHealthPanel({ projectId, className }: ExecutionHealthPa
                           ? t('dashboard.health.alertCritical', 'Critical')
                           : t('dashboard.health.alertWarning', 'Warning')
                         let label = t('dashboard.health.alert.llmEmptyRetry', 'LLM returned empty SQL payload repeatedly')
+                        let hint: string | null = null
                         switch (alert.id) {
                           case 'duplicate_alias':
                             label = t('dashboard.health.alert.duplicateAlias', 'Duplicate alias validation issues')
@@ -440,6 +466,50 @@ export function ExecutionHealthPanel({ projectId, className }: ExecutionHealthPa
                             break
                           case 'repair_short_circuit_low':
                             label = t('dashboard.health.alert.repairShortCircuitLow', 'Repair short-circuit hit rate is below baseline')
+                            break
+                          case 'repair_timeout_short_circuit_high':
+                            label = t('dashboard.health.alert.repairTimeoutShortCircuitHigh', 'Repair timeout short-circuit rate is elevated')
+                            hint = t(
+                              'dashboard.health.alertHint.repairTimeoutShortCircuitHigh',
+                              'Triggered when repair timeout short-circuit count reaches at least {threshold} out of {total} repair short-circuit events in this window.',
+                              {
+                                threshold: formatCount(alert.threshold, locale),
+                                total: formatCount(routeRepairSummary.repairShortCircuitTotal, locale),
+                              },
+                            )
+                            break
+                          case 'repair_budget_low_short_circuit_high':
+                            label = t('dashboard.health.alert.repairBudgetLowShortCircuitHigh', 'Repair budget-low short-circuit rate is elevated')
+                            hint = t(
+                              'dashboard.health.alertHint.repairBudgetLowShortCircuitHigh',
+                              'Triggered when budget-low repair short-circuit count reaches at least {threshold} out of {total} repair short-circuit events in this window.',
+                              {
+                                threshold: formatCount(alert.threshold, locale),
+                                total: formatCount(routeRepairSummary.repairShortCircuitTotal, locale),
+                              },
+                            )
+                            break
+                          case 'json_reask_high':
+                            label = t('dashboard.health.alert.jsonReaskHigh', 'Strict JSON re-ask rate is elevated')
+                            hint = t(
+                              'dashboard.health.alertHint.jsonReaskHigh',
+                              'Triggered when strict JSON re-ask count reaches at least {threshold} within {decisions} generation decisions in this window.',
+                              {
+                                threshold: formatCount(alert.threshold, locale),
+                                decisions: formatCount(generationDecisionTotal, locale),
+                              },
+                            )
+                            break
+                          case 'decompose_cancelled_high':
+                            label = t('dashboard.health.alert.decomposeCancelledHigh', 'Decompose cancellation rate is elevated')
+                            hint = t(
+                              'dashboard.health.alertHint.decomposeCancelledHigh',
+                              'Triggered when cancelled decompose stages reach at least {threshold} out of {total} decompose stages in this window.',
+                              {
+                                threshold: formatCount(alert.threshold, locale),
+                                total: formatCount(routeRepairSummary.decomposeStageTotal, locale),
+                              },
+                            )
                             break
                           case 'schema_link_fallback_high':
                             label = t('dashboard.health.alert.schemaLinkFallbackHigh', 'Schema-link fallback rate is elevated')
@@ -469,7 +539,18 @@ export function ExecutionHealthPanel({ projectId, className }: ExecutionHealthPa
                           >
                             <div className="min-w-0 pr-2">
                               <p className="truncate font-semibold">{label}</p>
-                              <p className="opacity-80">{levelLabel}</p>
+                              <p className="truncate opacity-80">
+                                {levelLabel}
+                                {hint && (
+                                  <span
+                                    className="ml-1 cursor-help underline decoration-dotted underline-offset-2"
+                                    title={hint}
+                                    aria-label={hint}
+                                  >
+                                    {t('dashboard.health.alertExplain', 'Explain')}
+                                  </span>
+                                )}
+                              </p>
                             </div>
                             <div className="shrink-0 text-right font-semibold">
                               <p>{formatCount(alert.count, locale)}</p>
@@ -481,7 +562,7 @@ export function ExecutionHealthPanel({ projectId, className }: ExecutionHealthPa
                     </div>
                   </div>
                 )}
-                <div className="grid grid-cols-2 gap-[5px] lg:grid-cols-6">
+                <div className="grid grid-cols-2 gap-[5px] lg:grid-cols-4">
                   <div className="rounded-md border border-gray-200 bg-white px-3 py-2 dark:border-gray-700 dark:bg-gray-900/50">
                     <p className="text-xs text-gray-500 dark:text-gray-400">
                       {t('dashboard.health.llmEmptyRetry', 'LLM Empty Retries')}
@@ -503,12 +584,68 @@ export function ExecutionHealthPanel({ projectId, className }: ExecutionHealthPa
                       {t('dashboard.health.repairShortCircuit', 'Repair Short-Circuit')}
                     </p>
                     <p className="text-sm font-semibold text-gray-900 dark:text-gray-100">
-                      {formatCount(routeDimensions?.repair_short_circuit || 0, locale)}
+                      {formatCount(routeRepairSummary.repairShortCircuitTotal, locale)}
                     </p>
                     <p className="truncate text-[11px] text-gray-500 dark:text-gray-400">
                       {topRepairShortCircuitReason
                         ? `${prettifyCounterKey(topRepairShortCircuitReason[0])}: ${formatCount(topRepairShortCircuitReason[1], locale)}`
                         : t('dashboard.health.none', 'None')}
+                    </p>
+                  </div>
+                  <div className="rounded-md border border-gray-200 bg-white px-3 py-2 dark:border-gray-700 dark:bg-gray-900/50">
+                    <p className="text-xs text-gray-500 dark:text-gray-400">
+                      {t('dashboard.health.repairIssueBucket', 'Repair Issue Bucket')}
+                    </p>
+                    <p className="truncate text-sm font-semibold text-gray-900 dark:text-gray-100">
+                      {topRepairIssueBucket
+                        ? prettifyCounterKey(topRepairIssueBucket[0])
+                        : t('dashboard.health.none', 'None')}
+                    </p>
+                    <p className="truncate text-[11px] text-gray-500 dark:text-gray-400">
+                      {formatCount(topRepairIssueBucket?.[1] || 0, locale)}
+                      {' · '}
+                      {t('dashboard.health.dominant', 'dominant')} {topRepairDominantIssueBucket
+                        ? `${prettifyCounterKey(topRepairDominantIssueBucket[0])} (${formatCount(topRepairDominantIssueBucket[1], locale)})`
+                        : t('dashboard.health.none', 'None')}
+                    </p>
+                  </div>
+                  <div className="rounded-md border border-gray-200 bg-white px-3 py-2 dark:border-gray-700 dark:bg-gray-900/50">
+                    <p className="text-xs text-gray-500 dark:text-gray-400">
+                      {t('dashboard.health.repairLocalPreflight', 'Repair Local Preflight')}
+                    </p>
+                    <p className="text-sm font-semibold text-gray-900 dark:text-gray-100">
+                      {formatCount(routeRepairSummary.repairLocalPreflight, locale)}
+                    </p>
+                    <p className="text-[11px] text-gray-500 dark:text-gray-400">
+                      {formatRatioPercent(routeRepairSummary.repairLocalPreflightRate, locale, 1)}
+                      {' · '}
+                      {t('dashboard.health.repairShortCircuit', 'Repair Short-Circuit')} {formatCount(routeRepairSummary.repairShortCircuitTotal, locale)}
+                    </p>
+                  </div>
+                  <div className="rounded-md border border-gray-200 bg-white px-3 py-2 dark:border-gray-700 dark:bg-gray-900/50">
+                    <p className="text-xs text-gray-500 dark:text-gray-400">
+                      {t('dashboard.health.repairTimeoutShortCircuit', 'Repair Timeout Short-Circuit')}
+                    </p>
+                    <p className="text-sm font-semibold text-gray-900 dark:text-gray-100">
+                      {formatCount(routeRepairSummary.repairTimeoutShortCircuit, locale)}
+                    </p>
+                    <p className="text-[11px] text-gray-500 dark:text-gray-400">
+                      {formatRatioPercent(routeRepairSummary.repairTimeoutShortCircuitRate, locale, 1)}
+                      {' · '}
+                      {t('dashboard.health.repairShortCircuit', 'Repair Short-Circuit')} {formatCount(routeRepairSummary.repairShortCircuitTotal, locale)}
+                    </p>
+                  </div>
+                  <div className="rounded-md border border-gray-200 bg-white px-3 py-2 dark:border-gray-700 dark:bg-gray-900/50">
+                    <p className="text-xs text-gray-500 dark:text-gray-400">
+                      {t('dashboard.health.repairBudgetLowShortCircuit', 'Repair Budget Low Short-Circuit')}
+                    </p>
+                    <p className="text-sm font-semibold text-gray-900 dark:text-gray-100">
+                      {formatCount(routeRepairSummary.repairBudgetLowShortCircuit, locale)}
+                    </p>
+                    <p className="text-[11px] text-gray-500 dark:text-gray-400">
+                      {formatRatioPercent(routeRepairSummary.repairBudgetLowShortCircuitRate, locale, 1)}
+                      {' · '}
+                      {t('dashboard.health.repairShortCircuit', 'Repair Short-Circuit')} {formatCount(routeRepairSummary.repairShortCircuitTotal, locale)}
                     </p>
                   </div>
                   <div className="rounded-md border border-gray-200 bg-white px-3 py-2 dark:border-gray-700 dark:bg-gray-900/50">
@@ -524,6 +661,19 @@ export function ExecutionHealthPanel({ projectId, className }: ExecutionHealthPa
                   </div>
                   <div className="rounded-md border border-gray-200 bg-white px-3 py-2 dark:border-gray-700 dark:bg-gray-900/50">
                     <p className="text-xs text-gray-500 dark:text-gray-400">
+                      {t('dashboard.health.jsonReask', 'Strict JSON Re-ask')}
+                    </p>
+                    <p className="text-sm font-semibold text-gray-900 dark:text-gray-100">
+                      {formatCount(routeRepairSummary.jsonReaskTotal, locale)}
+                    </p>
+                    <p className="text-[11px] text-gray-500 dark:text-gray-400">
+                      {formatRatioPercent(routeRepairSummary.jsonReaskRate, locale, 1)}
+                      {' · '}
+                      {formatCount(generationDecisionTotal, locale)} {t('dashboard.health.decisions', 'decisions')}
+                    </p>
+                  </div>
+                  <div className="rounded-md border border-gray-200 bg-white px-3 py-2 dark:border-gray-700 dark:bg-gray-900/50">
+                    <p className="text-xs text-gray-500 dark:text-gray-400">
                       {t('dashboard.health.topValidationIssue', 'Top Validation Issue')}
                     </p>
                     <p className="truncate text-sm font-semibold text-gray-900 dark:text-gray-100">
@@ -535,6 +685,19 @@ export function ExecutionHealthPanel({ projectId, className }: ExecutionHealthPa
                   </div>
                   <div className="rounded-md border border-gray-200 bg-white px-3 py-2 dark:border-gray-700 dark:bg-gray-900/50">
                     <p className="text-xs text-gray-500 dark:text-gray-400">
+                      {t('dashboard.health.validationIssueTransition', 'Validation Bucket Transition')}
+                    </p>
+                    <p className="truncate text-sm font-semibold text-gray-900 dark:text-gray-100">
+                      {topValidationIssueTransition
+                        ? prettifyTransitionKey(topValidationIssueTransition[0])
+                        : t('dashboard.health.none', 'None')}
+                    </p>
+                    <p className="text-xs text-gray-500 dark:text-gray-400">
+                      {formatCount(topValidationIssueTransition?.[1] || 0, locale)}
+                    </p>
+                  </div>
+                  <div className="rounded-md border border-gray-200 bg-white px-3 py-2 dark:border-gray-700 dark:bg-gray-900/50">
+                    <p className="text-xs text-gray-500 dark:text-gray-400">
                       {t('dashboard.health.llmHttpCircuitOpen', 'LLM HTTP Circuit Open')}
                     </p>
                     <p className="text-sm font-semibold text-gray-900 dark:text-gray-100">
@@ -542,6 +705,92 @@ export function ExecutionHealthPanel({ projectId, className }: ExecutionHealthPa
                     </p>
                     <p className="text-[11px] text-gray-500 dark:text-gray-400">
                       {t('dashboard.health.llmHttpCircuitTracked', 'tracked')} {formatCount(llmHttpCircuitTotalKeys, locale)}
+                    </p>
+                  </div>
+                  <div className="rounded-md border border-gray-200 bg-white px-3 py-2 dark:border-gray-700 dark:bg-gray-900/50">
+                    <p className="text-xs text-gray-500 dark:text-gray-400">
+                      {t('dashboard.health.decomposeLatency', 'Decompose Stage Latency')}
+                    </p>
+                    <p className="text-sm font-semibold text-gray-900 dark:text-gray-100">
+                      P50 {formatDecimal(routeRepairSummary.decomposeStageElapsedMsP50, locale)} ms
+                    </p>
+                    <p className="text-[11px] text-gray-500 dark:text-gray-400">
+                      P95 {formatDecimal(routeRepairSummary.decomposeStageElapsedMsP95, locale)} ms
+                      {' · '}
+                      {t('dashboard.health.total', 'Total')} {formatCount(routeRepairSummary.decomposeStageTotal, locale)}
+                    </p>
+                  </div>
+                  <div className="rounded-md border border-gray-200 bg-white px-3 py-2 dark:border-gray-700 dark:bg-gray-900/50">
+                    <p className="text-xs text-gray-500 dark:text-gray-400">
+                      {t('dashboard.health.decomposeBudgetExceeded', 'Decompose Budget Exceeded')}
+                    </p>
+                    <p className="text-sm font-semibold text-gray-900 dark:text-gray-100">
+                      {formatCount(routeRepairSummary.decomposeStageBudgetExceeded, locale)}
+                    </p>
+                    <p className="truncate text-[11px] text-gray-500 dark:text-gray-400">
+                      {formatRatioPercent(routeRepairSummary.decomposeStageBudgetExceededRate, locale, 1)}
+                      {' · '}
+                      {topDecomposeStageReason
+                        ? `${prettifyCounterKey(topDecomposeStageReason[0])}: ${formatCount(topDecomposeStageReason[1], locale)}`
+                        : t('dashboard.health.none', 'None')}
+                    </p>
+                  </div>
+                  <div className="rounded-md border border-gray-200 bg-white px-3 py-2 dark:border-gray-700 dark:bg-gray-900/50">
+                    <p className="text-xs text-gray-500 dark:text-gray-400">
+                      {t('dashboard.health.decomposeCancelled', 'Decompose Cancelled')}
+                    </p>
+                    <p className="text-sm font-semibold text-gray-900 dark:text-gray-100">
+                      {formatCount(routeRepairSummary.decomposeStageCancelled, locale)}
+                    </p>
+                    <p className="text-[11px] text-gray-500 dark:text-gray-400">
+                      {formatRatioPercent(routeRepairSummary.decomposeStageCancelledRate, locale, 1)}
+                      {' · '}
+                      {t('dashboard.health.total', 'Total')} {formatCount(routeRepairSummary.decomposeStageTotal, locale)}
+                    </p>
+                  </div>
+                  <div className="rounded-md border border-gray-200 bg-white px-3 py-2 dark:border-gray-700 dark:bg-gray-900/50">
+                    <p className="text-xs text-gray-500 dark:text-gray-400">
+                      {t('dashboard.health.repairIssueBucketStreak', 'Repair Issue Bucket Streak')}
+                    </p>
+                    <p className="text-sm font-semibold text-gray-900 dark:text-gray-100">
+                      {formatCount(routePathologySummary.repairIssueBucketStreakMax, locale)}
+                    </p>
+                    <p className="text-[11px] text-gray-500 dark:text-gray-400">
+                      {t('dashboard.health.circuitable', 'circuitable')}
+                      {' '}
+                      {formatCount(routePathologySummary.repairCircuitableIssueBucketStreakMax, locale)}
+                    </p>
+                  </div>
+                  <div className="rounded-md border border-gray-200 bg-white px-3 py-2 dark:border-gray-700 dark:bg-gray-900/50">
+                    <p className="text-xs text-gray-500 dark:text-gray-400">
+                      {t('dashboard.health.fallbackChainPattern', 'Fallback Chain Pattern')}
+                    </p>
+                    <p className="truncate text-sm font-semibold text-gray-900 dark:text-gray-100">
+                      {topFallbackChainPattern
+                        ? prettifyCounterKey(topFallbackChainPattern[0])
+                        : t('dashboard.health.none', 'None')}
+                    </p>
+                    <p className="truncate text-[11px] text-gray-500 dark:text-gray-400">
+                      {formatCount(topFallbackChainPattern?.[1] || 0, locale)}
+                      {' · '}
+                      {t('dashboard.health.step', 'step')} {topFallbackChainStep
+                        ? `${prettifyCounterKey(topFallbackChainStep[0])} (${formatCount(topFallbackChainStep[1], locale)})`
+                        : t('dashboard.health.none', 'None')}
+                    </p>
+                  </div>
+                  <div className="rounded-md border border-gray-200 bg-white px-3 py-2 dark:border-gray-700 dark:bg-gray-900/50">
+                    <p className="text-xs text-gray-500 dark:text-gray-400">
+                      {t('dashboard.health.didYouMeanAppliedRate', 'Did-You-Mean Applied')}
+                    </p>
+                    <p className="text-sm font-semibold text-gray-900 dark:text-gray-100">
+                      {formatRatioPercent(routeRepairSummary.didYouMeanFixAppliedRate, locale, 1)}
+                    </p>
+                    <p className="truncate text-[11px] text-gray-500 dark:text-gray-400">
+                      {formatCount(routeRepairSummary.didYouMeanFixApplied, locale)} / {formatCount(routeRepairSummary.didYouMeanFixTotal, locale)}
+                      {' · '}
+                      {(routeRepairSummary.didYouMeanStatuses[0]
+                        ? `${prettifyCounterKey(routeRepairSummary.didYouMeanStatuses[0][0])}: ${formatCount(routeRepairSummary.didYouMeanStatuses[0][1], locale)}`
+                        : t('dashboard.health.none', 'None'))}
                     </p>
                   </div>
                 </div>
@@ -781,7 +1030,7 @@ export function ExecutionHealthPanel({ projectId, className }: ExecutionHealthPa
                     </div>
                   )}
                 </div>
-                <div className="grid grid-cols-1 gap-2 lg:grid-cols-2">
+                <div className="grid grid-cols-1 gap-2 lg:grid-cols-3">
                   <div className="rounded-md border border-gray-200 bg-white px-3 py-2 dark:border-gray-700 dark:bg-gray-900/50">
                     <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
                       {t('dashboard.health.retryReasons', 'Retry Reasons')}
@@ -810,6 +1059,59 @@ export function ExecutionHealthPanel({ projectId, className }: ExecutionHealthPa
                         {validationIssueBuckets.map(([issue, count]) => (
                           <div key={issue} className="flex items-center justify-between text-xs text-gray-700 dark:text-gray-300">
                             <span className="truncate pr-2">{prettifyCounterKey(issue)}</span>
+                            <span className="font-medium">{formatCount(count, locale)}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  <div className="rounded-md border border-gray-200 bg-white px-3 py-2 dark:border-gray-700 dark:bg-gray-900/50">
+                    <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
+                      {t('dashboard.health.fallbackChainSteps', 'Fallback Chain Steps')}
+                    </p>
+                    {routePathologySummary.fallbackChainSteps.length === 0 ? (
+                      <p className="text-xs text-gray-500 dark:text-gray-400">{t('dashboard.health.none', 'None')}</p>
+                    ) : (
+                      <div className="space-y-1">
+                        {routePathologySummary.fallbackChainSteps.map(([step, count]) => (
+                          <div key={step} className="flex items-center justify-between text-xs text-gray-700 dark:text-gray-300">
+                            <span className="truncate pr-2">{prettifyCounterKey(step)}</span>
+                            <span className="font-medium">{formatCount(count, locale)}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+                <div className="grid grid-cols-1 gap-2 lg:grid-cols-2">
+                  <div className="rounded-md border border-gray-200 bg-white px-3 py-2 dark:border-gray-700 dark:bg-gray-900/50">
+                    <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
+                      {t('dashboard.health.validationIssueTransitions', 'Validation Bucket Transitions')}
+                    </p>
+                    {routePathologySummary.validationIssueTransitions.length === 0 ? (
+                      <p className="text-xs text-gray-500 dark:text-gray-400">{t('dashboard.health.none', 'None')}</p>
+                    ) : (
+                      <div className="space-y-1">
+                        {routePathologySummary.validationIssueTransitions.map(([transition, count]) => (
+                          <div key={transition} className="flex items-center justify-between text-xs text-gray-700 dark:text-gray-300">
+                            <span className="truncate pr-2">{prettifyTransitionKey(transition)}</span>
+                            <span className="font-medium">{formatCount(count, locale)}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  <div className="rounded-md border border-gray-200 bg-white px-3 py-2 dark:border-gray-700 dark:bg-gray-900/50">
+                    <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
+                      {t('dashboard.health.fallbackChainPatterns', 'Fallback Chain Patterns')}
+                    </p>
+                    {routePathologySummary.fallbackChainPatterns.length === 0 ? (
+                      <p className="text-xs text-gray-500 dark:text-gray-400">{t('dashboard.health.none', 'None')}</p>
+                    ) : (
+                      <div className="space-y-1">
+                        {routePathologySummary.fallbackChainPatterns.map(([pattern, count]) => (
+                          <div key={pattern} className="flex items-center justify-between text-xs text-gray-700 dark:text-gray-300">
+                            <span className="truncate pr-2">{prettifyCounterKey(pattern)}</span>
                             <span className="font-medium">{formatCount(count, locale)}</span>
                           </div>
                         ))}
